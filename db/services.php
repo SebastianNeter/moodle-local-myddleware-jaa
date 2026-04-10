@@ -34,6 +34,13 @@ $functions = [
             'description' => 'Return last access of users',
             'type'        => 'read',
     ],
+    "local_myddleware_get_course_completion_percentage_by_country" => [
+            "classname"   => "local_myddleware_external",
+            "methodname"  => "get_course_completion_percentage_by_country",
+            "classpath"   => "local/myddleware/externallib.php",
+            "description" => "Return completion percentage filtered by user country profile field",
+            "type"        => "read",
+    ],
     'local_myddleware_get_users_completion' => [
             'classname'   => 'local_myddleware_external',
             'methodname'  => 'get_users_completion',
@@ -154,6 +161,7 @@ $services = [
                         'local_myddleware_get_users_statistics_by_date',
                         'local_myddleware_get_quiz_attempts',
                         'local_myddleware_get_course_completion_percentage',
+                        'local_myddleware_get_course_completion_percentage_by_country',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
