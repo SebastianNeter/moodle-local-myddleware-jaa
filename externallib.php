@@ -1694,7 +1694,7 @@ class local_myddleware_external extends external_api {
             [
                 'time_modified' => new external_value(
                     PARAM_INT, get_string('param_timemodified', 'local_myddleware'), VALUE_DEFAULT, 0),
-                'id' => new external_value(PARAM_TEXT, get_string('param_id', 'local_myddleware'), VALUE_DEFAULT, 0),
+                'userid_courseid' => new external_value(PARAM_TEXT, get_string('param_id', 'local_myddleware'), VALUE_DEFAULT, 0),
             ]
         );
     }
@@ -1702,18 +1702,19 @@ class local_myddleware_external extends external_api {
     /**
      * This function calculates the completion percentage for course completions.
      * @param int $timemodified
-     * @param int $id
+     * @param int $userid_courseid
      * @return array with completion percentage details
      */
-    public static function get_course_completion_percentage($timemodified, $id) {
+    public static function get_course_completion_percentage($timemodified, $userid_courseid) {
         global $DB, $CFG;
         require_once($CFG->libdir . '/completionlib.php');
         $returncompletions = [];
 
+        $id = 0;
         // Parameter validation.
         $params = self::validate_parameters(
             self::get_course_completion_percentage_parameters(),
-            ['time_modified' => $timemodified, 'id' => $id]
+            ['time_modified' => $timemodified, 'userid_courseid' => $userid_courseid]
         );
 
         // Context validation.
@@ -1721,7 +1722,7 @@ class local_myddleware_external extends external_api {
         self::validate_context($context);
 
         // Get the last module completion id for the user/course ids.
-        if (!empty($params['id'])) {
+        if (!empty($params['userid_courseid'])) {
             $sql = "
                 SELECT
                     cmc.id,
@@ -1743,7 +1744,7 @@ class local_myddleware_external extends external_api {
                 LIMIT 1
                 ";
             // Get user from id  (id format <user_id>_<course_id>.
-            $ids = explode('_', $params['id']);
+            $ids = explode('_', $params['userid_courseid']);
             $queryparams = [
                                  'userid' => $ids[0],
                                  'courseid' => $ids[1],
@@ -1874,6 +1875,169 @@ class local_myddleware_external extends external_api {
                     'total_activities' => new external_value(PARAM_INT, get_string('return_totalactivities', 'local_myddleware')),
                     'overall_status' => new external_value(PARAM_TEXT, get_string('return_overallstatus', 'local_myddleware')),
                     'error' => new external_value(PARAM_TEXT, 'Error message if any'),
+                ]
+            )
+        );
+    }
+
+    // =========================================================================
+    // Method: get_course_completion_percentage_by_country
+    // Custom method to filter completion percentage by user country profile field.
+    // Added by JAA patch 2026-03-23.
+    // =========================================================================
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_course_completion_percentage_by_country_parameters() {
+        return new external_function_parameters(
+            [
+                "time_modified" => new external_value(
+                    PARAM_INT, get_string("param_timemodified", "local_myddleware"), VALUE_DEFAULT, 0),
+                "country_filter" => new external_value(
+                    PARAM_TEXT, "Country profile field shortname (e.g. arg, mex, col)", VALUE_REQUIRED),
+            ]
+        );
+    }
+
+    /**
+     * Calculates completion percentage for course completions,
+     * filtered by a user custom profile field (country).
+     * @param int $timemodified
+     * @param string $country_filter
+     * @return array with completion percentage details
+     */
+    public static function get_course_completion_percentage_by_country($timemodified, $country_filter) {
+        global $DB, $CFG;
+        require_once($CFG->libdir . "/completionlib.php");
+        $returncompletions = [];
+
+        $params = self::validate_parameters(
+            self::get_course_completion_percentage_by_country_parameters(),
+            ["time_modified" => $timemodified, "country_filter" => $country_filter]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+
+        $sql = "
+            SELECT
+                cmc.id,
+                cmc.userid,
+                cmc.completionstate,
+                cmc.timemodified,
+                cm.id coursemoduleid,
+                cm.module moduletype,
+                cm.instance,
+                cm.section,
+                cm.course courseid
+            FROM {course_modules_completion} cmc
+            INNER JOIN {course_modules} cm
+                ON cm.id = cmc.coursemoduleid
+            INNER JOIN {user_info_data} uid
+                ON uid.userid = cmc.userid
+            INNER JOIN {user_info_field} uif
+                ON uif.id = uid.fieldid
+            WHERE
+                    cmc.timemodified > :timemodified
+                AND uif.shortname = :country_filter
+                AND uid.data = 1
+            ORDER BY cmc.timemodified ASC
+        ";
+        $queryparams = [
+            "timemodified" => $params["time_modified"],
+            "country_filter" => $params["country_filter"],
+        ];
+        $rs = $DB->get_recordset_sql($sql, $queryparams);
+
+        $selectedcompletions = [];
+        foreach ($rs as $record) {
+            $key = $record->userid . "_" . $record->courseid;
+            if (!isset($selectedcompletions[$key]) ||
+                $record->timemodified > $selectedcompletions[$key]["timemodified"]) {
+                $selectedcompletions[$key] = [
+                    "userid" => $record->userid,
+                    "courseid" => $record->courseid,
+                    "timemodified" => $record->timemodified,
+                ];
+            }
+        }
+        $rs->close();
+
+        if (empty($selectedcompletions)) {
+            return [];
+        }
+
+        foreach ($selectedcompletions as $selectedcompletion) {
+            $percentage = 0;
+            $completedactivities = 0;
+            $totalactivities = 0;
+            $overallstatus = "Unknown";
+            $error = "";
+
+            try {
+                $course = $DB->get_record("course", ["id" => $selectedcompletion["courseid"]], "*", MUST_EXIST);
+                $completion = new completion_info($course);
+                if ($completion->is_enabled()) {
+                    $iscomplete = $completion->is_course_complete($selectedcompletion["userid"]);
+                    $overallstatus = $iscomplete ? "Complete" : "Incomplete";
+                    $modinfo = get_fast_modinfo($course, $selectedcompletion["userid"]);
+                    foreach ($modinfo->get_cms() as $cm) {
+                        if ($cm->completion != COMPLETION_TRACKING_NONE) {
+                            $totalactivities++;
+                            $completiondata = $completion->get_data($cm, false, $selectedcompletion["userid"]);
+                            if ($completiondata->completionstate == COMPLETION_COMPLETE ||
+                                $completiondata->completionstate == COMPLETION_COMPLETE_PASS) {
+                                $completedactivities++;
+                            }
+                        }
+                    }
+                    if ($totalactivities > 0) {
+                        $percentage = round(($completedactivities / $totalactivities) * 100, 2);
+                    }
+                } else {
+                    $error = "Completion tracking not enabled";
+                }
+            } catch (Exception $e) {
+                $error = "Exception: " . $e->getMessage();
+            }
+
+            $completiondata = [
+                "id" => $selectedcompletion["userid"] . "_" . $selectedcompletion["courseid"],
+                "userid" => $selectedcompletion["userid"],
+                "courseid" => $selectedcompletion["courseid"],
+                "percentage" => $percentage,
+                "completed_activities" => $completedactivities,
+                "total_activities" => $totalactivities,
+                "overall_status" => $overallstatus,
+                "timemodified" => $selectedcompletion["timemodified"],
+                "error" => $error,
+            ];
+            $returncompletions[] = $completiondata;
+        }
+
+        return $returncompletions;
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_course_completion_percentage_by_country_returns() {
+        return new external_multiple_structure(
+            new external_single_structure(
+                [
+                    "id" => new external_value(PARAM_TEXT, get_string("return_id", "local_myddleware")),
+                    "userid" => new external_value(PARAM_INT, get_string("return_userid", "local_myddleware")),
+                    "courseid" => new external_value(PARAM_INT, get_string("return_courseid", "local_myddleware")),
+                    "timemodified" => new external_value(PARAM_INT, get_string("return_timemodified", "local_myddleware")),
+                    "percentage" => new external_value(PARAM_FLOAT, get_string("return_percentage", "local_myddleware")),
+                    "completed_activities" => new external_value(
+                        PARAM_INT, get_string("return_completedactivities", "local_myddleware")),
+                    "total_activities" => new external_value(PARAM_INT, get_string("return_totalactivities", "local_myddleware")),
+                    "overall_status" => new external_value(PARAM_TEXT, get_string("return_overallstatus", "local_myddleware")),
+                    "error" => new external_value(PARAM_TEXT, "Error message if any"),
                 ]
             )
         );
