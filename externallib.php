@@ -2042,4 +2042,332 @@ class local_myddleware_external extends external_api {
             )
         );
     }
+
+    // =========================================================================
+    // Method: get_courses_with_users_progress
+    // Returns full course info + groups + enrolled students + completion + custom fields.
+    // Designed for on-demand pull from Salesforce (button on Course record).
+    // Added by JAA patch 2026-04-14.
+    // =========================================================================
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_courses_with_users_progress_parameters() {
+        return new external_function_parameters(
+            [
+                "courseids" => new external_multiple_structure(
+                    new external_value(PARAM_INT, "Moodle course ID"),
+                    "List of course IDs to fetch",
+                    VALUE_REQUIRED
+                ),
+            ]
+        );
+    }
+
+    /**
+     * For each course ID provided, returns the course info, its groups, and all enrolled
+     * students with their completion data, last access and selected custom profile fields.
+     * Only users with the "student" role are included.
+     *
+     * @param array $courseids Array of Moodle course IDs.
+     * @return array
+     */
+    public static function get_courses_with_users_progress($courseids) {
+        global $DB, $CFG;
+        require_once($CFG->libdir . "/completionlib.php");
+        require_once($CFG->libdir . "/enrollib.php");
+
+        $params = self::validate_parameters(
+            self::get_courses_with_users_progress_parameters(),
+            ["courseids" => $courseids]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // Custom profile fields we want to include in the response.
+        $customfieldshortnames = ["residencia", "genero", "nacimiento"];
+
+        // Resolve the "student" archetype role IDs once.
+        $studentroleids = [];
+        $studentroles = $DB->get_records("role", ["archetype" => "student"], "", "id");
+        foreach ($studentroles as $r) {
+            $studentroleids[] = (int)$r->id;
+        }
+        // Fallback: if no archetype student roles found, default to roleid 5 (Moodle default).
+        if (empty($studentroleids)) {
+            $studentroleids = [5];
+        }
+
+        // Pre-load the user_info_field IDs for the custom fields we care about.
+        list($insql, $inparams) = $DB->get_in_or_equal($customfieldshortnames, SQL_PARAMS_NAMED, "cf");
+        $customfields = $DB->get_records_select(
+            "user_info_field",
+            "shortname $insql",
+            $inparams,
+            "",
+            "id, shortname"
+        );
+        $customfieldidtoshortname = [];
+        foreach ($customfields as $cf) {
+            $customfieldidtoshortname[(int)$cf->id] = $cf->shortname;
+        }
+
+        $result = [];
+
+        foreach ($params["courseids"] as $courseid) {
+            $coursebase = [
+                "courseid" => (int)$courseid,
+                "course_fullname" => null,
+                "course_shortname" => null,
+                "course_idnumber" => null,
+                "course_visible" => 0,
+                "course_startdate" => 0,
+                "groups" => [],
+                "users" => [],
+                "error" => "",
+            ];
+
+            // 1) Course basic info ---------------------------------------------------
+            $course = $DB->get_record("course", ["id" => $courseid], "*");
+            if (!$course) {
+                $coursebase["error"] = "Course not found";
+                $result[] = $coursebase;
+                continue;
+            }
+
+            $coursebase["course_fullname"] = $course->fullname;
+            $coursebase["course_shortname"] = $course->shortname;
+            $coursebase["course_idnumber"] = $course->idnumber;
+            $coursebase["course_visible"] = (int)$course->visible;
+            $coursebase["course_startdate"] = (int)$course->startdate;
+
+            // 2) Groups in this course ----------------------------------------------
+            $groups = $DB->get_records("groups", ["courseid" => $courseid], "name ASC",
+                "id, name, description, idnumber");
+            foreach ($groups as $g) {
+                $coursebase["groups"][] = [
+                    "groupid" => (int)$g->id,
+                    "name" => $g->name,
+                    "description" => format_text($g->description ?? "", FORMAT_PLAIN),
+                    "idnumber" => $g->idnumber,
+                ];
+            }
+
+            // 3) Enrolled students with role + enrolment + lastaccess --------------
+            list($roleinsql, $roleparams) = $DB->get_in_or_equal($studentroleids, SQL_PARAMS_NAMED, "role");
+            $sql = "
+                SELECT
+                    u.id AS userid,
+                    u.username,
+                    u.firstname,
+                    u.lastname,
+                    u.email,
+                    u.timecreated AS user_timecreated,
+                    ra.roleid,
+                    r.shortname AS rolename,
+                    ue.status AS enrol_status,
+                    ue.timestart AS enrol_timestart,
+                    ue.timeend AS enrol_timeend,
+                    ue.timecreated AS enrol_timecreated,
+                    e.enrol AS enrol_method,
+                    ula.timeaccess AS lastaccess
+                FROM {user} u
+                INNER JOIN {user_enrolments} ue ON ue.userid = u.id
+                INNER JOIN {enrol} e ON e.id = ue.enrolid AND e.courseid = :courseid
+                INNER JOIN {context} ctx ON ctx.instanceid = e.courseid AND ctx.contextlevel = 50
+                INNER JOIN {role_assignments} ra ON ra.userid = u.id AND ra.contextid = ctx.id
+                INNER JOIN {role} r ON r.id = ra.roleid
+                LEFT JOIN {user_lastaccess} ula ON ula.userid = u.id AND ula.courseid = e.courseid
+                WHERE u.deleted = 0
+                  AND ra.roleid $roleinsql
+                ORDER BY u.lastname ASC, u.firstname ASC
+            ";
+            $sqlparams = array_merge(["courseid" => $courseid], $roleparams);
+            $users = $DB->get_records_sql($sql, $sqlparams);
+
+            // Deduplicate by userid (a student can have multiple enrolments) keeping latest.
+            $usersbyid = [];
+            foreach ($users as $u) {
+                $uid = (int)$u->userid;
+                if (!isset($usersbyid[$uid]) ||
+                    (int)$u->enrol_timecreated > (int)$usersbyid[$uid]->enrol_timecreated) {
+                    $usersbyid[$uid] = $u;
+                }
+            }
+
+            if (empty($usersbyid)) {
+                $result[] = $coursebase;
+                continue;
+            }
+
+            // 4) Custom profile fields for these users (one query) -----------------
+            $customfieldsbyuser = [];
+            if (!empty($customfieldidtoshortname)) {
+                list($useridsql, $useridparams) = $DB->get_in_or_equal(
+                    array_keys($usersbyid), SQL_PARAMS_NAMED, "uid");
+                list($fieldidsql, $fieldidparams) = $DB->get_in_or_equal(
+                    array_keys($customfieldidtoshortname), SQL_PARAMS_NAMED, "fid");
+                $cfsql = "SELECT id, userid, fieldid, data
+                          FROM {user_info_data}
+                          WHERE userid $useridsql AND fieldid $fieldidsql";
+                $cfparams = array_merge($useridparams, $fieldidparams);
+                $cfrecords = $DB->get_records_sql($cfsql, $cfparams);
+                foreach ($cfrecords as $cfr) {
+                    $shortname = $customfieldidtoshortname[(int)$cfr->fieldid] ?? null;
+                    if ($shortname !== null) {
+                        $customfieldsbyuser[(int)$cfr->userid][$shortname] = $cfr->data;
+                    }
+                }
+            }
+
+            // 5) Completion data per user (reuse pattern from get_course_completion_percentage)
+            $completioninfo = null;
+            try {
+                $completioninfo = new completion_info($course);
+            } catch (Exception $e) {
+                $completioninfo = null;
+            }
+
+            foreach ($usersbyid as $uid => $u) {
+                $percentage = 0;
+                $completedactivities = 0;
+                $totalactivities = 0;
+                $overallstatus = "Unknown";
+                $completionerror = "";
+                $completiontimemodified = 0;
+
+                try {
+                    if ($completioninfo && $completioninfo->is_enabled()) {
+                        $iscomplete = $completioninfo->is_course_complete($uid);
+                        $overallstatus = $iscomplete ? "Complete" : "Incomplete";
+                        $modinfo = get_fast_modinfo($course, $uid);
+                        foreach ($modinfo->get_cms() as $cm) {
+                            if ($cm->completion != COMPLETION_TRACKING_NONE) {
+                                $totalactivities++;
+                                $completiondata = $completioninfo->get_data($cm, false, $uid);
+                                if ($completiondata->completionstate == COMPLETION_COMPLETE ||
+                                    $completiondata->completionstate == COMPLETION_COMPLETE_PASS) {
+                                    $completedactivities++;
+                                }
+                                if (!empty($completiondata->timemodified) &&
+                                    $completiondata->timemodified > $completiontimemodified) {
+                                    $completiontimemodified = (int)$completiondata->timemodified;
+                                }
+                            }
+                        }
+                        if ($totalactivities > 0) {
+                            $percentage = round(($completedactivities / $totalactivities) * 100, 2);
+                        }
+                    } else {
+                        $completionerror = "Completion tracking not enabled";
+                    }
+                } catch (Exception $e) {
+                    $completionerror = "Exception: " . $e->getMessage();
+                }
+
+                // Build the custom_fields object with all requested shortnames (null if missing).
+                $userfields = [];
+                foreach ($customfieldshortnames as $sn) {
+                    $userfields[$sn] = $customfieldsbyuser[$uid][$sn] ?? null;
+                }
+
+                $coursebase["users"][] = [
+                    "userid" => $uid,
+                    "username" => $u->username,
+                    "firstname" => $u->firstname,
+                    "lastname" => $u->lastname,
+                    "email" => $u->email,
+                    "timecreated" => (int)$u->user_timecreated,
+                    "enrolment" => [
+                        "roleid" => (int)$u->roleid,
+                        "rolename" => $u->rolename,
+                        "status" => (int)$u->enrol_status,
+                        "timestart" => (int)$u->enrol_timestart,
+                        "timeend" => (int)$u->enrol_timeend,
+                        "timecreated" => (int)$u->enrol_timecreated,
+                        "enrolmethod" => $u->enrol_method,
+                    ],
+                    "completion" => [
+                        "percentage" => $percentage,
+                        "completed_activities" => $completedactivities,
+                        "total_activities" => $totalactivities,
+                        "overall_status" => $overallstatus,
+                        "timemodified" => $completiontimemodified,
+                        "error" => $completionerror,
+                    ],
+                    "lastaccess" => (int)($u->lastaccess ?? 0),
+                    "custom_fields" => $userfields,
+                ];
+            }
+
+            $result[] = $coursebase;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_courses_with_users_progress_returns() {
+        return new external_multiple_structure(
+            new external_single_structure(
+                [
+                    "courseid" => new external_value(PARAM_INT, "Moodle course ID"),
+                    "course_fullname" => new external_value(PARAM_TEXT, "Course full name", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "course_shortname" => new external_value(PARAM_TEXT, "Course short name", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "course_idnumber" => new external_value(PARAM_TEXT, "Course external ID", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "course_visible" => new external_value(PARAM_INT, "1 if visible, 0 otherwise"),
+                    "course_startdate" => new external_value(PARAM_INT, "Course start date timestamp"),
+                    "groups" => new external_multiple_structure(
+                        new external_single_structure([
+                            "groupid" => new external_value(PARAM_INT, "Group ID"),
+                            "name" => new external_value(PARAM_TEXT, "Group name"),
+                            "description" => new external_value(PARAM_RAW, "Group description"),
+                            "idnumber" => new external_value(PARAM_TEXT, "Group external ID"),
+                        ])
+                    ),
+                    "users" => new external_multiple_structure(
+                        new external_single_structure([
+                            "userid" => new external_value(PARAM_INT, "Moodle user ID"),
+                            "username" => new external_value(PARAM_TEXT, "Username"),
+                            "firstname" => new external_value(PARAM_TEXT, "First name"),
+                            "lastname" => new external_value(PARAM_TEXT, "Last name"),
+                            "email" => new external_value(PARAM_TEXT, "Email"),
+                            "timecreated" => new external_value(PARAM_INT, "User creation timestamp"),
+                            "enrolment" => new external_single_structure([
+                                "roleid" => new external_value(PARAM_INT, "Role ID"),
+                                "rolename" => new external_value(PARAM_TEXT, "Role short name"),
+                                "status" => new external_value(PARAM_INT, "0 active, 1 suspended"),
+                                "timestart" => new external_value(PARAM_INT, "Enrolment start timestamp"),
+                                "timeend" => new external_value(PARAM_INT, "Enrolment end timestamp (0 = none)"),
+                                "timecreated" => new external_value(PARAM_INT, "Enrolment created timestamp"),
+                                "enrolmethod" => new external_value(PARAM_TEXT, "manual, self, cohort, etc"),
+                            ]),
+                            "completion" => new external_single_structure([
+                                "percentage" => new external_value(PARAM_FLOAT, "0-100"),
+                                "completed_activities" => new external_value(PARAM_INT, "Number of completed activities"),
+                                "total_activities" => new external_value(PARAM_INT, "Number of activities tracked"),
+                                "overall_status" => new external_value(PARAM_TEXT, "Complete | Incomplete | Unknown"),
+                                "timemodified" => new external_value(PARAM_INT, "Latest activity completion timestamp"),
+                                "error" => new external_value(PARAM_TEXT, "Error message if completion calc failed"),
+                            ]),
+                            "lastaccess" => new external_value(PARAM_INT, "Last access to this course timestamp (0 if never)"),
+                            "custom_fields" => new external_single_structure([
+                                "residencia" => new external_value(PARAM_RAW, "User residencia profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                                "genero" => new external_value(PARAM_RAW, "User genero profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                                "nacimiento" => new external_value(PARAM_RAW, "User nacimiento profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            ]),
+                        ])
+                    ),
+                    "error" => new external_value(PARAM_TEXT, "Error message if course not found or other issue"),
+                ]
+            )
+        );
+    }
 }

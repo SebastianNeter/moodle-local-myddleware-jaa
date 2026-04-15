@@ -139,6 +139,13 @@ $functions = [
             'description' => 'Return percentage completion of users and courses',
             'type'        => 'read',
     ],
+    'local_myddleware_get_courses_with_users_progress' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_courses_with_users_progress',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return courses with their groups, enrolled students, completion and custom profile fields. Designed for on-demand pull from Salesforce.',
+            'type'        => 'read',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -162,6 +169,7 @@ $services = [
                         'local_myddleware_get_quiz_attempts',
                         'local_myddleware_get_course_completion_percentage',
                         'local_myddleware_get_course_completion_percentage_by_country',
+                        'local_myddleware_get_courses_with_users_progress',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
