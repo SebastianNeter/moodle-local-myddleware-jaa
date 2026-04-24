@@ -2370,4 +2370,358 @@ class local_myddleware_external extends external_api {
             )
         );
     }
+
+    // =========================================================================
+    // Method: get_groups_with_users_progress
+    //
+    // Group-centric counterpart of get_courses_with_users_progress.
+    // Returns members (only users with the student archetype role on the
+    // group's course) for each requested group, with enrolment, completion,
+    // last access to the course, and selected custom profile fields.
+    //
+    // Designed to be called from a Salesforce button on a GROUP record.
+    // Per-group error model: a missing groupid returns members=[] + course=null
+    // + error="Group not found" for that group, without failing the rest.
+    //
+    // Kept deliberately separate from get_courses_with_users_progress so that
+    // existing integrations (button on Course record) keep working unchanged.
+    // Added by JAA 2026-04-24.
+    // =========================================================================
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_groups_with_users_progress_parameters() {
+        return new external_function_parameters(
+            [
+                "groupids" => new external_multiple_structure(
+                    new external_value(PARAM_INT, "Moodle group ID"),
+                    "List of group IDs to fetch",
+                    VALUE_REQUIRED
+                ),
+            ]
+        );
+    }
+
+    /**
+     * For each group ID provided, returns the group info, the course it belongs
+     * to, and all members of the group that have the student role on that
+     * course, with their completion data, last access and selected custom
+     * profile fields.
+     *
+     * Only users with the "student" archetype role are included — same policy
+     * as get_courses_with_users_progress. Teachers/managers are excluded.
+     *
+     * @param array $groupids Array of Moodle group IDs.
+     * @return array
+     */
+    public static function get_groups_with_users_progress($groupids) {
+        global $DB, $CFG;
+        require_once($CFG->libdir . "/completionlib.php");
+        require_once($CFG->libdir . "/enrollib.php");
+
+        $params = self::validate_parameters(
+            self::get_groups_with_users_progress_parameters(),
+            ["groupids" => $groupids]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // Same 3 custom profile fields as get_courses_with_users_progress.
+        $customfieldshortnames = ["residencia", "genero", "nacimiento"];
+
+        // Resolve the "student" archetype role IDs once.
+        $studentroleids = [];
+        $studentroles = $DB->get_records("role", ["archetype" => "student"], "", "id");
+        foreach ($studentroles as $r) {
+            $studentroleids[] = (int)$r->id;
+        }
+        if (empty($studentroleids)) {
+            $studentroleids = [5];
+        }
+
+        // Pre-load the user_info_field IDs for the custom fields we care about.
+        list($insql, $inparams) = $DB->get_in_or_equal($customfieldshortnames, SQL_PARAMS_NAMED, "cf");
+        $customfields = $DB->get_records_select(
+            "user_info_field",
+            "shortname $insql",
+            $inparams,
+            "",
+            "id, shortname"
+        );
+        $customfieldidtoshortname = [];
+        foreach ($customfields as $cf) {
+            $customfieldidtoshortname[(int)$cf->id] = $cf->shortname;
+        }
+
+        $result = [];
+
+        foreach ($params["groupids"] as $groupid) {
+            $groupbase = [
+                "groupid" => (int)$groupid,
+                "name" => null,
+                "description" => null,
+                "idnumber" => null,
+                "course" => null,
+                "members" => [],
+                "error" => "",
+            ];
+
+            // 1) Group basic info + parent course -----------------------------
+            $group = $DB->get_record("groups", ["id" => $groupid], "*");
+            if (!$group) {
+                $groupbase["error"] = "Group not found";
+                $result[] = $groupbase;
+                continue;
+            }
+
+            $groupbase["name"] = $group->name;
+            $groupbase["description"] = format_text($group->description ?? "", FORMAT_PLAIN);
+            $groupbase["idnumber"] = $group->idnumber;
+
+            $course = $DB->get_record("course", ["id" => $group->courseid], "*");
+            if (!$course) {
+                // Group exists but its course does not (rare, defensive).
+                $groupbase["error"] = "Course not found for this group";
+                $result[] = $groupbase;
+                continue;
+            }
+
+            $groupbase["course"] = [
+                "courseid" => (int)$course->id,
+                "course_fullname" => $course->fullname,
+                "course_shortname" => $course->shortname,
+                "course_idnumber" => $course->idnumber,
+                "course_visible" => (int)$course->visible,
+                "course_startdate" => (int)$course->startdate,
+            ];
+
+            // 2) Members of the group that are enrolled students in the course
+            list($roleinsql, $roleparams) = $DB->get_in_or_equal($studentroleids, SQL_PARAMS_NAMED, "role");
+            $sql = "
+                SELECT
+                    u.id AS userid,
+                    u.username,
+                    u.firstname,
+                    u.lastname,
+                    u.email,
+                    u.timecreated AS user_timecreated,
+                    ra.roleid,
+                    r.shortname AS rolename,
+                    ue.status AS enrol_status,
+                    ue.timestart AS enrol_timestart,
+                    ue.timeend AS enrol_timeend,
+                    ue.timecreated AS enrol_timecreated,
+                    e.enrol AS enrol_method,
+                    ula.timeaccess AS lastaccess,
+                    gm.timeadded AS group_joined_at
+                FROM {groups_members} gm
+                INNER JOIN {user} u ON u.id = gm.userid
+                INNER JOIN {user_enrolments} ue ON ue.userid = u.id
+                INNER JOIN {enrol} e ON e.id = ue.enrolid AND e.courseid = :courseid
+                INNER JOIN {context} ctx ON ctx.instanceid = e.courseid AND ctx.contextlevel = 50
+                INNER JOIN {role_assignments} ra ON ra.userid = u.id AND ra.contextid = ctx.id
+                INNER JOIN {role} r ON r.id = ra.roleid
+                LEFT JOIN {user_lastaccess} ula ON ula.userid = u.id AND ula.courseid = e.courseid
+                WHERE gm.groupid = :groupid
+                  AND u.deleted = 0
+                  AND ra.roleid $roleinsql
+                ORDER BY u.lastname ASC, u.firstname ASC
+            ";
+            $sqlparams = array_merge(
+                ["groupid" => $groupid, "courseid" => $course->id],
+                $roleparams
+            );
+            $users = $DB->get_records_sql($sql, $sqlparams);
+
+            // Deduplicate by userid (a student can have multiple enrolments)
+            // keeping latest enrolment timestamp. Mirrors the course-centric method.
+            $usersbyid = [];
+            foreach ($users as $u) {
+                $uid = (int)$u->userid;
+                if (!isset($usersbyid[$uid]) ||
+                    (int)$u->enrol_timecreated > (int)$usersbyid[$uid]->enrol_timecreated) {
+                    $usersbyid[$uid] = $u;
+                }
+            }
+
+            if (empty($usersbyid)) {
+                $result[] = $groupbase;
+                continue;
+            }
+
+            // 3) Custom profile fields for these users (one batch query) -----
+            $customfieldsbyuser = [];
+            if (!empty($customfieldidtoshortname)) {
+                list($useridsql, $useridparams) = $DB->get_in_or_equal(
+                    array_keys($usersbyid), SQL_PARAMS_NAMED, "uid");
+                list($fieldidsql, $fieldidparams) = $DB->get_in_or_equal(
+                    array_keys($customfieldidtoshortname), SQL_PARAMS_NAMED, "fid");
+                $cfsql = "SELECT id, userid, fieldid, data
+                          FROM {user_info_data}
+                          WHERE userid $useridsql AND fieldid $fieldidsql";
+                $cfparams = array_merge($useridparams, $fieldidparams);
+                $cfrecords = $DB->get_records_sql($cfsql, $cfparams);
+                foreach ($cfrecords as $cfr) {
+                    $shortname = $customfieldidtoshortname[(int)$cfr->fieldid] ?? null;
+                    if ($shortname !== null) {
+                        $customfieldsbyuser[(int)$cfr->userid][$shortname] = $cfr->data;
+                    }
+                }
+            }
+
+            // 4) Completion per user (same pattern as get_courses_with_users_progress)
+            $completioninfo = null;
+            try {
+                $completioninfo = new completion_info($course);
+            } catch (Exception $e) {
+                $completioninfo = null;
+            }
+
+            foreach ($usersbyid as $uid => $u) {
+                $percentage = 0;
+                $completedactivities = 0;
+                $totalactivities = 0;
+                $overallstatus = "Unknown";
+                $completionerror = "";
+                $completiontimemodified = 0;
+
+                try {
+                    if ($completioninfo && $completioninfo->is_enabled()) {
+                        $iscomplete = $completioninfo->is_course_complete($uid);
+                        $overallstatus = $iscomplete ? "Complete" : "Incomplete";
+                        $modinfo = get_fast_modinfo($course, $uid);
+                        foreach ($modinfo->get_cms() as $cm) {
+                            if ($cm->completion != COMPLETION_TRACKING_NONE) {
+                                $totalactivities++;
+                                $completiondata = $completioninfo->get_data($cm, false, $uid);
+                                if ($completiondata->completionstate == COMPLETION_COMPLETE ||
+                                    $completiondata->completionstate == COMPLETION_COMPLETE_PASS) {
+                                    $completedactivities++;
+                                }
+                                if (!empty($completiondata->timemodified) &&
+                                    $completiondata->timemodified > $completiontimemodified) {
+                                    $completiontimemodified = (int)$completiondata->timemodified;
+                                }
+                            }
+                        }
+                        if ($totalactivities > 0) {
+                            $percentage = round(($completedactivities / $totalactivities) * 100, 2);
+                        }
+                    } else {
+                        $completionerror = "Completion tracking not enabled";
+                    }
+                } catch (Exception $e) {
+                    $completionerror = "Exception: " . $e->getMessage();
+                }
+
+                $userfields = [];
+                foreach ($customfieldshortnames as $sn) {
+                    $userfields[$sn] = $customfieldsbyuser[$uid][$sn] ?? null;
+                }
+
+                $groupbase["members"][] = [
+                    "userid" => $uid,
+                    "username" => $u->username,
+                    "firstname" => $u->firstname,
+                    "lastname" => $u->lastname,
+                    "email" => $u->email,
+                    "timecreated" => (int)$u->user_timecreated,
+                    "group_joined_at" => (int)$u->group_joined_at,
+                    "enrolment" => [
+                        "roleid" => (int)$u->roleid,
+                        "rolename" => $u->rolename,
+                        "status" => (int)$u->enrol_status,
+                        "timestart" => (int)$u->enrol_timestart,
+                        "timeend" => (int)$u->enrol_timeend,
+                        "timecreated" => (int)$u->enrol_timecreated,
+                        "enrolmethod" => $u->enrol_method,
+                    ],
+                    "completion" => [
+                        "percentage" => $percentage,
+                        "completed_activities" => $completedactivities,
+                        "total_activities" => $totalactivities,
+                        "overall_status" => $overallstatus,
+                        "timemodified" => $completiontimemodified,
+                        "error" => $completionerror,
+                    ],
+                    "lastaccess" => (int)($u->lastaccess ?? 0),
+                    "custom_fields" => $userfields,
+                ];
+            }
+
+            $result[] = $groupbase;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_groups_with_users_progress_returns() {
+        return new external_multiple_structure(
+            new external_single_structure(
+                [
+                    "groupid" => new external_value(PARAM_INT, "Moodle group ID (matches the requested ID)"),
+                    "name" => new external_value(PARAM_TEXT, "Group name", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "description" => new external_value(PARAM_RAW, "Group description (plain)", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "idnumber" => new external_value(PARAM_TEXT, "Group external ID (at JAA stores SF Group Id)", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                    "course" => new external_single_structure(
+                        [
+                            "courseid" => new external_value(PARAM_INT, "Course ID that owns this group"),
+                            "course_fullname" => new external_value(PARAM_TEXT, "Course full name", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "course_shortname" => new external_value(PARAM_TEXT, "Course short name", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "course_idnumber" => new external_value(PARAM_TEXT, "Course external ID", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "course_visible" => new external_value(PARAM_INT, "1 if visible, 0 otherwise"),
+                            "course_startdate" => new external_value(PARAM_INT, "Course start date timestamp"),
+                        ],
+                        "Course this group belongs to",
+                        VALUE_OPTIONAL,
+                        null,
+                        NULL_ALLOWED
+                    ),
+                    "members" => new external_multiple_structure(
+                        new external_single_structure([
+                            "userid" => new external_value(PARAM_INT, "Moodle user ID"),
+                            "username" => new external_value(PARAM_TEXT, "Username"),
+                            "firstname" => new external_value(PARAM_TEXT, "First name"),
+                            "lastname" => new external_value(PARAM_TEXT, "Last name"),
+                            "email" => new external_value(PARAM_TEXT, "Email"),
+                            "timecreated" => new external_value(PARAM_INT, "User creation timestamp"),
+                            "group_joined_at" => new external_value(PARAM_INT, "When this user was added to the group"),
+                            "enrolment" => new external_single_structure([
+                                "roleid" => new external_value(PARAM_INT, "Role ID"),
+                                "rolename" => new external_value(PARAM_TEXT, "Role short name"),
+                                "status" => new external_value(PARAM_INT, "0 active, 1 suspended"),
+                                "timestart" => new external_value(PARAM_INT, "Enrolment start timestamp"),
+                                "timeend" => new external_value(PARAM_INT, "Enrolment end timestamp (0 = none)"),
+                                "timecreated" => new external_value(PARAM_INT, "Enrolment created timestamp"),
+                                "enrolmethod" => new external_value(PARAM_TEXT, "manual, self, cohort, etc"),
+                            ]),
+                            "completion" => new external_single_structure([
+                                "percentage" => new external_value(PARAM_FLOAT, "0-100"),
+                                "completed_activities" => new external_value(PARAM_INT, "Number of completed activities"),
+                                "total_activities" => new external_value(PARAM_INT, "Number of activities tracked"),
+                                "overall_status" => new external_value(PARAM_TEXT, "Complete | Incomplete | Unknown"),
+                                "timemodified" => new external_value(PARAM_INT, "Latest activity completion timestamp"),
+                                "error" => new external_value(PARAM_TEXT, "Error message if completion calc failed"),
+                            ]),
+                            "lastaccess" => new external_value(PARAM_INT, "Last access to this course timestamp (0 if never)"),
+                            "custom_fields" => new external_single_structure([
+                                "residencia" => new external_value(PARAM_RAW, "User residencia profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                                "genero" => new external_value(PARAM_RAW, "User genero profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                                "nacimiento" => new external_value(PARAM_RAW, "User nacimiento profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            ]),
+                        ])
+                    ),
+                    "error" => new external_value(PARAM_TEXT, "Error message if group not found or other issue"),
+                ]
+            )
+        );
+    }
 }
