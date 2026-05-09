@@ -146,6 +146,13 @@ $functions = [
             'description' => 'Return courses with their groups, enrolled students, completion and custom profile fields. Designed for on-demand pull from Salesforce.',
             'type'        => 'read',
     ],
+    'local_myddleware_get_roc_group_enrolments' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_roc_group_enrolments',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return flat rows, one per (userid, courseid), for users who joined a group whose custom field :group_country_filter=1 (arg/roc/mex/ury/col/per), via self-enrolment, since :time_modified. Active non-suspended users only. Feeds a Myddleware rule that pushes each enrolment once to a custom SF staging object.',
+            'type'        => 'read',
+    ],
     'local_myddleware_get_groups_with_users_progress' => [
             'classname'   => 'local_myddleware_external',
             'methodname'  => 'get_groups_with_users_progress',
@@ -184,6 +191,7 @@ $services = [
                         'local_myddleware_get_course_completion_percentage',
                         'local_myddleware_get_course_completion_percentage_by_country',
                         'local_myddleware_get_courses_with_users_progress',
+                        'local_myddleware_get_roc_group_enrolments',
                         'local_myddleware_get_groups_with_users_progress',
                         'local_myddleware_get_roc_groups_by_date',
                         'core_course_create_courses',

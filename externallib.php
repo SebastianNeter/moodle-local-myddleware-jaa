@@ -2386,6 +2386,395 @@ class local_myddleware_external extends external_api {
     }
 
     // =========================================================================
+    // Method: get_roc_group_enrolments
+    //
+    // Returns one FLAT row per (userid, courseid) for users that entered a group
+    // flagged with a country custom field = 1 (arg / roc / mex / ury / col / per),
+    // since :time_modified, via self-enrolment only, on users that are active
+    // (not deleted, not suspended).
+    //
+    // The country to filter by is passed as :group_country_filter (required).
+    // This mirrors the pattern of get_course_completion_percentage_by_country
+    // but applied to the GROUP custom field (component='core_group'), not the
+    // user profile field.
+    //
+    // Response shape: flat (every field at top level) so Myddleware's field
+    // mapping UI can map each column 1:1 to the target SF custom object.
+    //
+    // Date reference field for Myddleware: "timemodified" (without underscore),
+    // to match the convention of other JAA methods (get_*_by_date and
+    // get_course_completion_percentage_by_country).
+    //
+    // Dedup for SF upsert: field "external_id" = "<userid>_<courseid>".
+    //
+    // Added by JAA 2026-04-20.
+    // =========================================================================
+
+    /**
+     * Strip Moodle multi-language tags keeping ONLY Spanish content.
+     *
+     * - If the text has no {mlang} tags → returns as-is.
+     * - If it has {mlang es}...{mlang} (including es_AR, es_MX, etc.) → returns
+     *   the Spanish content.
+     * - If it has other mlang tags but no Spanish block → returns empty string
+     *   (máxima rigurosidad: we ship rigorously in Spanish or nothing).
+     *
+     * @param string|null $text raw text possibly containing mlang tags.
+     * @return string Spanish content (trimmed), empty string if rigorously unavailable.
+     */
+    private static function strip_mlang_to_spanish($text) {
+        if ($text === null || $text === "") {
+            return "";
+        }
+        // Cast in case the DB returned int/float.
+        $text = (string)$text;
+        if (strpos($text, "{mlang") === false) {
+            return trim($text);
+        }
+        // Match {mlang es} or {mlang es_XX}...{mlang}. Closing tag is literal "{mlang}".
+        if (preg_match_all('/\{mlang\s+es(?:[_-][a-zA-Z]+)?\s*\}(.*?)\{mlang\s*\}/is', $text, $matches)) {
+            // Concat all Spanish blocks (there can be multiple in rich content).
+            return trim(implode(" ", $matches[1]));
+        }
+        // Tagged but no Spanish block → rigorous: empty.
+        return "";
+    }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_roc_group_enrolments_parameters() {
+        return new external_function_parameters(
+            [
+                "time_modified" => new external_value(
+                    PARAM_INT,
+                    "Unix timestamp. Returns enrolments whose group_members.timeadded >= this value.",
+                    VALUE_DEFAULT,
+                    0
+                ),
+                "group_country_filter" => new external_value(
+                    PARAM_TEXT,
+                    "Group custom field shortname to filter on (arg, roc, mex, ury, col, per). Only groups where this boolean custom field = 1 are returned.",
+                    VALUE_REQUIRED
+                ),
+            ]
+        );
+    }
+
+    /**
+     * Returns one flat row per (user, course) for users who were added to a
+     * group whose custom field :group_country_filter equals 1, since
+     * :time_modified, and whose enrolment in that course is of method 'self'.
+     *
+     * Only active, non-deleted, non-suspended users are returned.
+     *
+     * Response shape is FLAT (no nested objects) so Myddleware's field mapping
+     * UI can map each column 1:1 to the target SF custom object.
+     *
+     * @param int    $time_modified         Lower bound on group_members.timeadded (>=).
+     * @param string $group_country_filter  Group custom field shortname (arg/roc/mex/ury/col/per).
+     * @return array
+     */
+    public static function get_roc_group_enrolments($time_modified, $group_country_filter) {
+        global $DB;
+
+        $params = self::validate_parameters(
+            self::get_roc_group_enrolments_parameters(),
+            [
+                "time_modified"        => $time_modified,
+                "group_country_filter" => $group_country_filter,
+            ]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // The 10 user custom profile field shortnames that JAA exposes as
+        // dedicated columns (user_cf_<shortname>). Matches the rows in
+        // mdl_user_info_field as of 2026-04-20.
+        $usercfshortnames = [
+            "nacimiento",
+            "arg",
+            "genero",
+            "roc",
+            "residencia",
+            "mex",
+            "ury",
+            "col",
+            "per",
+            "sf_contact_id",
+        ];
+
+        $sql = "
+            SELECT
+                gm.id AS id,
+                gm.timeadded AS timemodified,
+                gm.userid AS gm_userid,
+                g.courseid AS gm_courseid,
+
+                u.id AS user_id,
+                u.username AS user_username,
+                u.idnumber AS user_idnumber,
+                u.firstname AS user_firstname,
+                u.lastname AS user_lastname,
+                u.email AS user_email,
+                u.phone1 AS user_phone1,
+                u.phone2 AS user_phone2,
+                u.address AS user_address,
+                u.city AS user_city,
+                u.country AS user_country,
+                u.timezone AS user_timezone,
+                u.lang AS user_lang,
+                u.institution AS user_institution,
+                u.department AS user_department,
+                u.description AS user_description,
+                u.firstaccess AS user_firstaccess,
+                u.lastaccess AS user_lastaccess,
+                u.timecreated AS user_timecreated,
+                u.auth AS user_auth,
+                u.confirmed AS user_confirmed,
+
+                c.id AS course_id,
+                c.fullname AS course_fullname,
+                c.shortname AS course_shortname,
+                c.idnumber AS course_idnumber,
+                c.startdate AS course_startdate,
+                c.visible AS course_visible,
+
+                g.id AS group_id,
+                g.name AS group_name,
+                g.idnumber AS group_idnumber,
+                g.description AS group_description,
+                gm.timeadded AS group_joined_at,
+
+                e.enrol AS enrol_method,
+                ue.timecreated AS enrol_timecreated,
+                ue.timestart AS enrol_timestart,
+                ue.timeend AS enrol_timeend
+
+            FROM {groups_members} gm
+            INNER JOIN {groups} g ON g.id = gm.groupid
+            INNER JOIN {course} c ON c.id = g.courseid
+            INNER JOIN {user} u ON u.id = gm.userid
+            INNER JOIN {user_enrolments} ue ON ue.userid = u.id
+            INNER JOIN {enrol} e ON e.id = ue.enrolid
+                                AND e.courseid = g.courseid
+                                AND e.enrol = :enrolmethod
+            INNER JOIN {customfield_data} cfd ON cfd.instanceid = g.id
+            INNER JOIN {customfield_field} cff ON cff.id = cfd.fieldid
+                                              AND cff.shortname = :groupcountryfilter
+            INNER JOIN {customfield_category} cfc ON cfc.id = cff.categoryid
+                                                  AND cfc.component = :cffcomponent
+            WHERE gm.timeadded >= :timemodified
+              AND cfd.intvalue = 1
+              AND ue.status = 0
+              AND u.deleted = 0
+              AND u.suspended = 0
+            ORDER BY gm.timeadded ASC, gm.id ASC
+        ";
+
+        $sqlparams = [
+            "timemodified"       => (int)$params["time_modified"],
+            "enrolmethod"        => "self",
+            "groupcountryfilter" => $params["group_country_filter"],
+            "cffcomponent"       => "core_group",
+        ];
+
+        $rows = $DB->get_records_sql($sql, $sqlparams);
+
+        if (empty($rows)) {
+            return [];
+        }
+
+        // Dedupe (user, course) keeping the earliest group_joined_at. Per
+        // business rule a user should not be in more than one ROC group of the
+        // same course, but we guard against it defensively.
+        $byuc = [];
+        foreach ($rows as $r) {
+            $key = $r->user_id . "_" . $r->course_id;
+            if (!isset($byuc[$key]) ||
+                (int)$r->group_joined_at < (int)$byuc[$key]->group_joined_at) {
+                $byuc[$key] = $r;
+            }
+        }
+
+        // Batch-fetch the 10 known custom profile fields for all users in the
+        // result in a single query.
+        $userids = [];
+        foreach ($byuc as $r) {
+            $userids[(int)$r->user_id] = true;
+        }
+        $userids = array_keys($userids);
+
+        $customfieldsbyuser = [];
+        if (!empty($userids)) {
+            list($useridsql, $useridparams) = $DB->get_in_or_equal(
+                $userids, SQL_PARAMS_NAMED, "u");
+            list($fieldidsql, $fieldidparams) = $DB->get_in_or_equal(
+                $usercfshortnames, SQL_PARAMS_NAMED, "sn");
+            $cfsql = "
+                SELECT uid.id, uid.userid, uif.shortname, uid.data
+                FROM {user_info_data} uid
+                INNER JOIN {user_info_field} uif ON uif.id = uid.fieldid
+                WHERE uid.userid $useridsql
+                  AND uif.shortname $fieldidsql
+            ";
+            $cfparams = array_merge($useridparams, $fieldidparams);
+            $cfrecords = $DB->get_records_sql($cfsql, $cfparams);
+            foreach ($cfrecords as $cfr) {
+                $uid = (int)$cfr->userid;
+                $sn = $cfr->shortname;
+                $customfieldsbyuser[$uid][$sn] = $cfr->data;
+            }
+        }
+
+        // Build the flat response.
+        $result = [];
+        foreach ($byuc as $r) {
+            $uid = (int)$r->user_id;
+            $cid = (int)$r->course_id;
+
+            $cfvalues = $customfieldsbyuser[$uid] ?? [];
+
+            $row = [
+                "id"                 => (int)$r->id,
+                "external_id"        => $uid . "_" . $cid,
+                "timemodified"       => (int)$r->timemodified,
+
+                "user_id"            => $uid,
+                "user_username"      => (string)$r->user_username,
+                "user_idnumber"      => (string)($r->user_idnumber ?? ""),
+                "user_firstname"     => (string)$r->user_firstname,
+                "user_lastname"      => (string)$r->user_lastname,
+                "user_email"         => (string)$r->user_email,
+                "user_phone1"        => (string)($r->user_phone1 ?? ""),
+                "user_phone2"        => (string)($r->user_phone2 ?? ""),
+                "user_address"       => (string)($r->user_address ?? ""),
+                "user_city"          => (string)($r->user_city ?? ""),
+                "user_country"       => (string)($r->user_country ?? ""),
+                "user_timezone"      => (string)($r->user_timezone ?? ""),
+                "user_lang"          => (string)($r->user_lang ?? ""),
+                "user_institution"   => (string)($r->user_institution ?? ""),
+                "user_department"    => (string)($r->user_department ?? ""),
+                "user_description"   => self::strip_mlang_to_spanish($r->user_description ?? ""),
+                "user_firstaccess"   => (int)$r->user_firstaccess,
+                "user_lastaccess"    => (int)$r->user_lastaccess,
+                "user_timecreated"   => (int)$r->user_timecreated,
+                "user_auth"          => (string)$r->user_auth,
+                "user_confirmed"     => (int)$r->user_confirmed,
+
+                "course_id"          => $cid,
+                "course_fullname"    => self::strip_mlang_to_spanish($r->course_fullname),
+                "course_shortname"   => (string)$r->course_shortname,
+                "course_idnumber"    => (string)($r->course_idnumber ?? ""),
+                "course_startdate"   => (int)$r->course_startdate,
+                "course_visible"     => (int)$r->course_visible,
+
+                "group_id"           => (int)$r->group_id,
+                "group_name"         => self::strip_mlang_to_spanish($r->group_name),
+                "group_idnumber"     => (string)($r->group_idnumber ?? ""),
+                "group_description"  => self::strip_mlang_to_spanish($r->group_description ?? ""),
+                "group_joined_at"    => (int)$r->group_joined_at,
+
+                "enrol_method"       => (string)$r->enrol_method,
+                "enrol_timecreated"  => (int)$r->enrol_timecreated,
+                "enrol_timestart"    => (int)$r->enrol_timestart,
+                "enrol_timeend"      => (int)$r->enrol_timeend,
+
+                // 10 user custom profile fields, stripped to Spanish.
+                // Any missing field defaults to empty string (never null).
+                "user_cf_nacimiento"    => self::strip_mlang_to_spanish($cfvalues["nacimiento"]    ?? ""),
+                "user_cf_arg"           => self::strip_mlang_to_spanish($cfvalues["arg"]           ?? ""),
+                "user_cf_genero"        => self::strip_mlang_to_spanish($cfvalues["genero"]        ?? ""),
+                "user_cf_roc"           => self::strip_mlang_to_spanish($cfvalues["roc"]           ?? ""),
+                "user_cf_residencia"    => self::strip_mlang_to_spanish($cfvalues["residencia"]    ?? ""),
+                "user_cf_mex"           => self::strip_mlang_to_spanish($cfvalues["mex"]           ?? ""),
+                "user_cf_ury"           => self::strip_mlang_to_spanish($cfvalues["ury"]           ?? ""),
+                "user_cf_col"           => self::strip_mlang_to_spanish($cfvalues["col"]           ?? ""),
+                "user_cf_per"           => self::strip_mlang_to_spanish($cfvalues["per"]           ?? ""),
+                "user_cf_sf_contact_id" => self::strip_mlang_to_spanish($cfvalues["sf_contact_id"] ?? ""),
+            ];
+
+            $result[] = $row;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_roc_group_enrolments_returns() {
+        return new external_multiple_structure(
+            new external_single_structure([
+                // Row identity + Myddleware metadata
+                "id"                 => new external_value(PARAM_INT,  "groups_members.id — Moodle internal PK (Myddleware row identity)"),
+                "external_id"        => new external_value(PARAM_TEXT, "Composite key '<userid>_<courseid>' — configure as duplicate_check in the Myddleware rule"),
+                "timemodified"       => new external_value(PARAM_INT,  "groups_members.timeadded — used by Myddleware as datereference"),
+
+                // User
+                "user_id"            => new external_value(PARAM_INT,  "Moodle user ID"),
+                "user_username"      => new external_value(PARAM_TEXT, "Username"),
+                "user_idnumber"      => new external_value(PARAM_TEXT, "User external ID (often DNI)", VALUE_OPTIONAL, ""),
+                "user_firstname"    => new external_value(PARAM_TEXT, "First name"),
+                "user_lastname"      => new external_value(PARAM_TEXT, "Last name"),
+                "user_email"         => new external_value(PARAM_TEXT, "Email"),
+                "user_phone1"        => new external_value(PARAM_TEXT, "Primary phone",   VALUE_OPTIONAL, ""),
+                "user_phone2"        => new external_value(PARAM_TEXT, "Secondary phone", VALUE_OPTIONAL, ""),
+                "user_address"       => new external_value(PARAM_TEXT, "Address",         VALUE_OPTIONAL, ""),
+                "user_city"          => new external_value(PARAM_TEXT, "City",            VALUE_OPTIONAL, ""),
+                "user_country"       => new external_value(PARAM_TEXT, "Country code (ISO 3166-1 alpha-2)", VALUE_OPTIONAL, ""),
+                "user_timezone"      => new external_value(PARAM_TEXT, "Timezone",        VALUE_OPTIONAL, ""),
+                "user_lang"          => new external_value(PARAM_TEXT, "UI language",     VALUE_OPTIONAL, ""),
+                "user_institution"   => new external_value(PARAM_TEXT, "Institution",     VALUE_OPTIONAL, ""),
+                "user_department"    => new external_value(PARAM_TEXT, "Department",      VALUE_OPTIONAL, ""),
+                "user_description"   => new external_value(PARAM_RAW,  "Profile bio (stripped to Spanish)", VALUE_OPTIONAL, ""),
+                "user_firstaccess"   => new external_value(PARAM_INT,  "First access timestamp (0 if never)"),
+                "user_lastaccess"    => new external_value(PARAM_INT,  "Last access timestamp (0 if never)"),
+                "user_timecreated"   => new external_value(PARAM_INT,  "User creation timestamp"),
+                "user_auth"          => new external_value(PARAM_TEXT, "Auth method (email=self-registered, manual=admin/api/bulk, oauth2/saml2=SSO)"),
+                "user_confirmed"     => new external_value(PARAM_INT,  "1 confirmed, 0 not"),
+
+                // Course (metadata only)
+                "course_id"          => new external_value(PARAM_INT,  "Course ID"),
+                "course_fullname"    => new external_value(PARAM_TEXT, "Course full name (stripped to Spanish)"),
+                "course_shortname"   => new external_value(PARAM_TEXT, "Course short name"),
+                "course_idnumber"    => new external_value(PARAM_TEXT, "Course external ID", VALUE_OPTIONAL, ""),
+                "course_startdate"   => new external_value(PARAM_INT,  "Course start date timestamp"),
+                "course_visible"     => new external_value(PARAM_INT,  "1 visible, 0 hidden"),
+
+                // Group (metadata only)
+                "group_id"           => new external_value(PARAM_INT,  "Group ID"),
+                "group_name"         => new external_value(PARAM_TEXT, "Group name (stripped to Spanish)"),
+                "group_idnumber"     => new external_value(PARAM_TEXT, "Group external ID (at JAA stores SF Group ID)", VALUE_OPTIONAL, ""),
+                "group_description"  => new external_value(PARAM_RAW,  "Group description (stripped to Spanish)", VALUE_OPTIONAL, ""),
+                "group_joined_at"    => new external_value(PARAM_INT,  "Timestamp when user was added to this group"),
+
+                // Enrolment context (always self/active here, kept for auditability)
+                "enrol_method"       => new external_value(PARAM_TEXT, "Always 'self' for this endpoint"),
+                "enrol_timecreated"  => new external_value(PARAM_INT,  "Enrolment record created timestamp"),
+                "enrol_timestart"    => new external_value(PARAM_INT,  "Enrolment start (0 if no restriction)"),
+                "enrol_timeend"      => new external_value(PARAM_INT,  "Enrolment end (0 if no restriction)"),
+
+                // User custom profile fields (hardcoded list of 10 JAA shortnames)
+                "user_cf_nacimiento"    => new external_value(PARAM_RAW,  "Date of birth (Unix timestamp string, or empty)",  VALUE_OPTIONAL, ""),
+                "user_cf_arg"           => new external_value(PARAM_RAW,  "Flag ARG (checkbox: '1' or '0' or '')",            VALUE_OPTIONAL, ""),
+                "user_cf_genero"        => new external_value(PARAM_RAW,  "Gender (menu value, stripped to Spanish)",         VALUE_OPTIONAL, ""),
+                "user_cf_roc"           => new external_value(PARAM_RAW,  "Flag ROC (checkbox)",                              VALUE_OPTIONAL, ""),
+                "user_cf_residencia"    => new external_value(PARAM_RAW,  "Country of residence (menu, stripped to Spanish)", VALUE_OPTIONAL, ""),
+                "user_cf_mex"           => new external_value(PARAM_RAW,  "Flag MEX",                                         VALUE_OPTIONAL, ""),
+                "user_cf_ury"           => new external_value(PARAM_RAW,  "Flag URY",                                         VALUE_OPTIONAL, ""),
+                "user_cf_col"           => new external_value(PARAM_RAW,  "Flag COL",                                         VALUE_OPTIONAL, ""),
+                "user_cf_per"           => new external_value(PARAM_RAW,  "Flag PER",                                         VALUE_OPTIONAL, ""),
+                "user_cf_sf_contact_id" => new external_value(PARAM_RAW,  "Salesforce Contact ID (text)",                     VALUE_OPTIONAL, ""),
+            ])
+        );
+    }
+
+    // =========================================================================
     // Method: get_groups_with_users_progress
     //
     // Group-centric counterpart of get_courses_with_users_progress.
