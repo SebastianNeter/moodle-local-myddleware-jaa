@@ -2724,4 +2724,138 @@ class local_myddleware_external extends external_api {
             )
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Method: get_roc_groups_by_date
+    // Dedicated to rule 4.1 ROC. Returns groups modified after $timemodified
+    // (or a specific group by id) that have customfield 'roc' = 1 AND
+    // 'idaccioneducativaroc' non-empty. Each group includes all its customfields
+    // (shortname + valueraw) so the Myddleware connector can map them as fields.
+    //
+    // This is intentionally a separate function from get_groups_by_date so any
+    // existing rule using groups remains unaffected.
+    // -------------------------------------------------------------------------
+
+    public static function get_roc_groups_by_date_parameters() {
+        return new external_function_parameters(
+            [
+                'time_modified' => new external_value(
+                    PARAM_INT, get_string('param_timemodified', 'local_myddleware'), VALUE_DEFAULT, 0),
+                'id' => new external_value(PARAM_INT, get_string('param_id', 'local_myddleware'), VALUE_DEFAULT, 0),
+            ]
+        );
+    }
+
+    public static function get_roc_groups_by_date($timemodified, $id) {
+        global $DB, $CFG;
+        require_once($CFG->dirroot . "/group/externallib.php");
+
+        $params = self::validate_parameters(
+            self::get_roc_groups_by_date_parameters(),
+            ['time_modified' => $timemodified, 'id' => $id]
+        );
+        $context = context_system::instance();
+        self::validate_context($context);
+
+        // DB-level filter: only groups with roc=1 AND idaccioneducativaroc != ''.
+        // Filtering at DB avoids loading all groups into PHP.
+        $sql = "SELECT g.*
+                FROM {groups} g
+                WHERE " . (!empty($params['id'])
+                            ? "g.id = :id"
+                            : "g.timemodified > :timemodified") . "
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {customfield_data} d
+                      JOIN {customfield_field} f ON f.id = d.fieldid
+                      JOIN {customfield_category} c ON c.id = f.categoryid
+                      WHERE d.instanceid = g.id
+                        AND c.component = 'core_group' AND c.area = 'group'
+                        AND f.shortname = 'roc'
+                        AND d.intvalue = 1
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {customfield_data} d2
+                      JOIN {customfield_field} f2 ON f2.id = d2.fieldid
+                      JOIN {customfield_category} c2 ON c2.id = f2.categoryid
+                      WHERE d2.instanceid = g.id
+                        AND c2.component = 'core_group' AND c2.area = 'group'
+                        AND f2.shortname = 'idaccioneducativaroc'
+                        AND COALESCE(d2.shortcharvalue, d2.value, '') <> ''
+                  )
+                ORDER BY g.timemodified ASC";
+        $queryparams = [
+            'id' => !empty($params['id']) ? $params['id'] : 0,
+            'timemodified' => !empty($params['time_modified']) ? $params['time_modified'] : 0,
+        ];
+        $selectedgroups = $DB->get_records_sql($sql, $queryparams);
+
+        $returnedgroups = [];
+        if (!empty($selectedgroups)) {
+            foreach ($selectedgroups as $value) {
+                $groupdetails = core_group_external::get_groups([$value->id]);
+                $groupdetails[0]['timemodified'] = $value->timemodified;
+                $groupdetails[0]['customfields'] = self::get_roc_group_customfields($value->id);
+                $returnedgroups[] = $groupdetails[0];
+            }
+        }
+        return $returnedgroups;
+    }
+
+    /**
+     * Helper for get_roc_groups_by_date. Returns all customfields of a group
+     * as an array of [shortname, name, type, value, valueraw].
+     */
+    private static function get_roc_group_customfields($groupid) {
+        global $DB;
+        $sql = "SELECT f.shortname, f.name, f.type,
+                       d.intvalue, d.shortcharvalue, d.value
+                FROM {customfield_field} f
+                JOIN {customfield_category} c ON c.id = f.categoryid
+                LEFT JOIN {customfield_data} d
+                       ON d.fieldid = f.id AND d.instanceid = :groupid
+                WHERE c.component = 'core_group' AND c.area = 'group'
+                ORDER BY f.sortorder";
+        $rows = $DB->get_records_sql($sql, ['groupid' => $groupid]);
+
+        $result = [];
+        foreach ($rows as $row) {
+            if ($row->type === 'checkbox') {
+                $raw = ($row->intvalue !== null) ? (string)$row->intvalue : '';
+            } else if (in_array($row->type, ['text', 'textarea', 'select'])) {
+                $raw = $row->shortcharvalue ?? ($row->value ?? '');
+            } else {
+                $raw = $row->value ?? '';
+            }
+            $result[] = [
+                'shortname' => $row->shortname,
+                'name' => $row->name,
+                'type' => $row->type,
+                'value' => (string)$raw,
+                'valueraw' => (string)$raw,
+            ];
+        }
+        return $result;
+    }
+
+    public static function get_roc_groups_by_date_returns() {
+        global $CFG;
+        require_once($CFG->dirroot . "/group/externallib.php");
+        $structure = core_group_external::get_groups_returns();
+        $structure->content->keys['timemodified'] = new external_value(
+            PARAM_INT, get_string('return_timemodified', 'local_myddleware'));
+        $structure->content->keys['customfields'] = new external_multiple_structure(
+            new external_single_structure([
+                'shortname' => new external_value(PARAM_TEXT, 'Custom field shortname'),
+                'name'      => new external_value(PARAM_TEXT, 'Custom field name'),
+                'type'      => new external_value(PARAM_TEXT, 'Custom field type'),
+                'value'     => new external_value(PARAM_RAW, 'Custom field formatted value'),
+                'valueraw'  => new external_value(PARAM_RAW, 'Custom field raw value'),
+            ]),
+            'Group custom fields',
+            VALUE_OPTIONAL
+        );
+        return $structure;
+    }
 }
