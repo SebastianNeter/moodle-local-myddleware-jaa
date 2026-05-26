@@ -166,14 +166,28 @@ Only users with the **student** archetype role on the parent course are returned
 
 ### Completion object
 
+> **IMPORTANT — semantics changed in v2.4.1 (2026-05-26)**: `percentage`, `completed_activities` and `total_activities` now count **ONLY the activities required for course completion** (Moodle "Course completion" → activity criteria, `course_completion_criteria.criteriatype = 4`). Activities that have completion tracking but are NOT part of the course completion criteria are **excluded** from all three. Before v2.4.1 these counted all completion-tracked activities.
+
 | Field | Type | Description |
 |---|---|---|
-| `percentage` | float | 0–100 across activities with completion tracking enabled |
-| `completed_activities` | int | Activities the user has completed |
-| `total_activities` | int | Activities tracked for completion in the course |
-| `overall_status` | string | `Complete`, `Incomplete`, or `Unknown` |
-| `timemodified` | int | Latest activity completion timestamp |
-| `error` | string | Empty on success. `"Completion tracking not enabled"` if the course doesn't have completion. Other error messages for unexpected exceptions |
+| `percentage` | float | 0–100 across **required activities only** (course completion criteria, type=activity). `round((completed_required / total_required) * 100, 2)` |
+| `completed_activities` | int | Required activities the user has completed (state `COMPLETE` or `COMPLETE_PASS`) |
+| `total_activities` | int | Number of activities required for course completion (`criteriatype=4`) |
+| `overall_status` | string | `Complete`, `Incomplete`, or `Unknown`. Derived from `is_course_complete()` which evaluates ALL completion criteria (not only activity ones) — so it can be `Complete` while `percentage < 100`, or `Incomplete` while `percentage = 100` |
+| `timemodified` | int | Latest completion timestamp across the required activities |
+| `error` | string | See below |
+
+**`error` values for the completion object:**
+
+| Value | Meaning |
+|---|---|
+| `""` (empty) | Success — percentage reflects required-activity progress |
+| `"Completion tracking not enabled"` | The course does not have completion tracking turned on |
+| `"No required activities configured for this course"` | Completion IS enabled, but the course has no activity-type completion criteria (`criteriatype=4`). The course may use other criteria (grade, manual self-completion, enrolment duration) which are NOT activities. `percentage = 0` in this case |
+| `"Failed to load required activities: ..."` | Defensive — DB error fetching the criteria |
+| `"Exception: ..."` | Unexpected exception during completion calculation |
+
+**Why required-only**: this percentage is meant to answer "how close is the student to course completion as JAA defines it" — not "how much optional material did they touch". Optional/extra activities with completion tracking do not move the number.
 
 ### Custom fields object
 
@@ -257,3 +271,4 @@ All three are read-only. They coexist without overlap.
 ## Changelog
 
 - **2026-04-24** (plugin v2.3.3, version `2026042401`): added by JAA patch. Separate method from the course-centric one — no breaking change to existing consumers.
+- **2026-05-26** (plugin v2.4.1, version `2026052202`): **BREAKING semantics change**. `completion.percentage`, `completed_activities` and `total_activities` now count ONLY activities required for course completion (`course_completion_criteria.criteriatype = 4`), not all completion-tracked activities. New error value `"No required activities configured for this course"`. Salesforce consumers that read `percentage` must be aware the number now reflects required-activity progress. Field names unchanged (no payload schema break).

@@ -2573,12 +2573,34 @@ class local_myddleware_external extends external_api {
                 }
             }
 
-            // 4) Completion per user (same pattern as get_courses_with_users_progress)
+            // 4) Completion per user — counts ONLY activities required for course completion
+            //    (criteria type 4 = activity completion criterion). Activities outside the
+            //    course_completion_criteria are ignored for the percentage. See API doc
+            //    for the rationale.
             $completioninfo = null;
             try {
                 $completioninfo = new completion_info($course);
             } catch (Exception $e) {
                 $completioninfo = null;
+            }
+
+            // Pre-fetch required activities for this course (criteriatype=4). One query per course.
+            $requiredcmidsmap = [];
+            $requiredactivitieserror = "";
+            try {
+                $requiredcmids = $DB->get_fieldset_select(
+                    "course_completion_criteria",
+                    "moduleinstance",
+                    "course = :courseid AND criteriatype = 4",
+                    ["courseid" => $course->id]
+                );
+                if (empty($requiredcmids)) {
+                    $requiredactivitieserror = "No required activities configured for this course";
+                } else {
+                    $requiredcmidsmap = array_flip($requiredcmids);
+                }
+            } catch (Exception $e) {
+                $requiredactivitieserror = "Failed to load required activities: " . $e->getMessage();
             }
 
             foreach ($usersbyid as $uid => $u) {
@@ -2593,9 +2615,16 @@ class local_myddleware_external extends external_api {
                     if ($completioninfo && $completioninfo->is_enabled()) {
                         $iscomplete = $completioninfo->is_course_complete($uid);
                         $overallstatus = $iscomplete ? "Complete" : "Incomplete";
-                        $modinfo = get_fast_modinfo($course, $uid);
-                        foreach ($modinfo->get_cms() as $cm) {
-                            if ($cm->completion != COMPLETION_TRACKING_NONE) {
+                        if (!empty($requiredcmidsmap)) {
+                            $modinfo = get_fast_modinfo($course, $uid);
+                            foreach ($modinfo->get_cms() as $cm) {
+                                // Only count activities REQUIRED for course completion (criteriatype=4).
+                                if (!isset($requiredcmidsmap[$cm->id])) {
+                                    continue;
+                                }
+                                if ($cm->completion == COMPLETION_TRACKING_NONE) {
+                                    continue;
+                                }
                                 $totalactivities++;
                                 $completiondata = $completioninfo->get_data($cm, false, $uid);
                                 if ($completiondata->completionstate == COMPLETION_COMPLETE ||
@@ -2607,9 +2636,12 @@ class local_myddleware_external extends external_api {
                                     $completiontimemodified = (int)$completiondata->timemodified;
                                 }
                             }
-                        }
-                        if ($totalactivities > 0) {
-                            $percentage = round(($completedactivities / $totalactivities) * 100, 2);
+                            if ($totalactivities > 0) {
+                                $percentage = round(($completedactivities / $totalactivities) * 100, 2);
+                            }
+                        } else {
+                            // No required activities (criteriatype=4) configured for this course.
+                            $completionerror = $requiredactivitieserror;
                         }
                     } else {
                         $completionerror = "Completion tracking not enabled";
