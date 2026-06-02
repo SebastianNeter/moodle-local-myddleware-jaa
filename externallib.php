@@ -1903,9 +1903,10 @@ class local_myddleware_external extends external_api {
 
     /**
      * Calculates completion percentage for course completions,
-     * filtered by a user custom profile field (country).
+     * filtered by a GROUP customfield (country) on a group that contains the user in the SAME course as the completion.
+     * Replaces the previous user-profile-field filter so cross-program users do not leak completions across programs.
      * @param int $timemodified
-     * @param string $country_filter
+     * @param string $country_filter Group customfield shortname (e.g. arg, roc, mex, col, per, ury).
      * @return array with completion percentage details
      */
     public static function get_course_completion_percentage_by_country($timemodified, $country_filter) {
@@ -1921,6 +1922,11 @@ class local_myddleware_external extends external_api {
         $context = context_system::instance();
         self::validate_context($context);
 
+        // Filter by group customfield instead of user profile field:
+        // a completion is included only when the user is a member of a group, in the SAME
+        // course as the completion, that has the customfield <country_filter> set to '1'.
+        // This ensures we only sync completions inside the program (e.g. ROC) context,
+        // and not unrelated completions that a multi-program user may have.
         $sql = "
             SELECT
                 cmc.id,
@@ -1935,14 +1941,22 @@ class local_myddleware_external extends external_api {
             FROM {course_modules_completion} cmc
             INNER JOIN {course_modules} cm
                 ON cm.id = cmc.coursemoduleid
-            INNER JOIN {user_info_data} uid
-                ON uid.userid = cmc.userid
-            INNER JOIN {user_info_field} uif
-                ON uif.id = uid.fieldid
             WHERE
                     cmc.timemodified > :timemodified
-                AND uif.shortname = :country_filter
-                AND uid.data = 1
+                AND EXISTS (
+                    SELECT 1
+                    FROM {groups_members} gm
+                    INNER JOIN {groups} g
+                        ON g.id = gm.groupid
+                        AND g.courseid = cm.course
+                    INNER JOIN {customfield_data} cfd
+                        ON cfd.instanceid = g.id
+                    INNER JOIN {customfield_field} cff
+                        ON cff.id = cfd.fieldid
+                    WHERE gm.userid = cmc.userid
+                      AND cff.shortname = :country_filter
+                      AND cfd.value = '1'
+                )
             ORDER BY cmc.timemodified ASC
         ";
         $queryparams = [
