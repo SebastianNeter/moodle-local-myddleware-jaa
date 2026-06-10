@@ -2477,7 +2477,8 @@ class local_myddleware_external extends external_api {
      * @return array
      */
     public static function get_roc_group_enrolments($time_modified, $group_country_filter) {
-        global $DB;
+        global $DB, $CFG;
+        require_once($CFG->libdir . "/completionlib.php");
 
         $params = self::validate_parameters(
             self::get_roc_group_enrolments_parameters(),
@@ -2552,7 +2553,10 @@ class local_myddleware_external extends external_api {
                 e.enrol AS enrol_method,
                 ue.timecreated AS enrol_timecreated,
                 ue.timestart AS enrol_timestart,
-                ue.timeend AS enrol_timeend
+                ue.timeend AS enrol_timeend,
+
+                ra.roleid AS role_id,
+                rl.shortname AS role_shortname
 
             FROM {groups_members} gm
             INNER JOIN {groups} g ON g.id = gm.groupid
@@ -2561,7 +2565,11 @@ class local_myddleware_external extends external_api {
             INNER JOIN {user_enrolments} ue ON ue.userid = u.id
             INNER JOIN {enrol} e ON e.id = ue.enrolid
                                 AND e.courseid = g.courseid
-                                AND e.enrol = :enrolmethod
+            LEFT JOIN {context} ctx ON ctx.instanceid = c.id
+                                   AND ctx.contextlevel = 50
+            LEFT JOIN {role_assignments} ra ON ra.userid = u.id
+                                           AND ra.contextid = ctx.id
+            LEFT JOIN {role} rl ON rl.id = ra.roleid
             INNER JOIN {customfield_data} cfd ON cfd.instanceid = g.id
             INNER JOIN {customfield_field} cff ON cff.id = cfd.fieldid
                                               AND cff.shortname = :groupcountryfilter
@@ -2572,12 +2580,19 @@ class local_myddleware_external extends external_api {
               AND ue.status = 0
               AND u.deleted = 0
               AND u.suspended = 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {user_info_data} mido
+                  INNER JOIN {user_info_field} midf ON midf.id = mido.fieldid
+                  WHERE mido.userid = u.id
+                    AND midf.shortname = 'myddleware_origin'
+                    AND mido.data = 'myddleware'
+              )
             ORDER BY gm.timeadded ASC, gm.id ASC
         ";
 
         $sqlparams = [
             "timemodified"       => (int)$params["time_modified"],
-            "enrolmethod"        => "self",
             "groupcountryfilter" => $params["group_country_filter"],
             "cffcomponent"       => "core_group",
         ];
@@ -2630,13 +2645,81 @@ class local_myddleware_external extends external_api {
             }
         }
 
+        // Completion per (user, course) — counts ONLY activities required for
+        // course completion (criteria type 4), same policy as
+        // get_groups_with_users_progress. Cheap here because the by-date SQL
+        // already narrowed the result to newly added members only.
+        $courserecords = [];
+        $completioninfobycourse = [];
+        $requiredcmidsbycourse = [];
+        $completionbyuc = [];
+        foreach ($byuc as $key => $r) {
+            $cid = (int)$r->course_id;
+            $uid = (int)$r->user_id;
+
+            if (!isset($courserecords[$cid])) {
+                $courserecords[$cid] = $DB->get_record("course", ["id" => $cid]);
+                try {
+                    $completioninfobycourse[$cid] = $courserecords[$cid]
+                        ? new completion_info($courserecords[$cid])
+                        : null;
+                } catch (Exception $e) {
+                    $completioninfobycourse[$cid] = null;
+                }
+                $requiredcmids = $DB->get_fieldset_select(
+                    "course_completion_criteria",
+                    "moduleinstance",
+                    "course = :courseid AND criteriatype = 4",
+                    ["courseid" => $cid]
+                );
+                $requiredcmidsbycourse[$cid] = empty($requiredcmids) ? [] : array_flip($requiredcmids);
+            }
+
+            $percentage = 0;
+            $completed = 0;
+            $total = 0;
+            try {
+                $completioninfo = $completioninfobycourse[$cid];
+                $requiredcmidsmap = $requiredcmidsbycourse[$cid];
+                if ($completioninfo && $completioninfo->is_enabled() && !empty($requiredcmidsmap)) {
+                    $modinfo = get_fast_modinfo($courserecords[$cid], $uid);
+                    foreach ($modinfo->get_cms() as $cm) {
+                        if (!isset($requiredcmidsmap[$cm->id])) {
+                            continue;
+                        }
+                        if ($cm->completion == COMPLETION_TRACKING_NONE) {
+                            continue;
+                        }
+                        $total++;
+                        $completiondata = $completioninfo->get_data($cm, false, $uid);
+                        if ($completiondata->completionstate == COMPLETION_COMPLETE ||
+                            $completiondata->completionstate == COMPLETION_COMPLETE_PASS) {
+                            $completed++;
+                        }
+                    }
+                    if ($total > 0) {
+                        $percentage = round(($completed / $total) * 100, 2);
+                    }
+                }
+            } catch (Exception $e) {
+                // Leave zeros — completion is informational for the staging row.
+                $percentage = 0;
+            }
+            $completionbyuc[$key] = [
+                "percentage" => $percentage,
+                "completed"  => $completed,
+                "total"      => $total,
+            ];
+        }
+
         // Build the flat response.
         $result = [];
-        foreach ($byuc as $r) {
+        foreach ($byuc as $key => $r) {
             $uid = (int)$r->user_id;
             $cid = (int)$r->course_id;
 
             $cfvalues = $customfieldsbyuser[$uid] ?? [];
+            $completion = $completionbyuc[$key] ?? ["percentage" => 0, "completed" => 0, "total" => 0];
 
             $row = [
                 "id"                 => (int)$r->id,
@@ -2682,6 +2765,13 @@ class local_myddleware_external extends external_api {
                 "enrol_timecreated"  => (int)$r->enrol_timecreated,
                 "enrol_timestart"    => (int)$r->enrol_timestart,
                 "enrol_timeend"      => (int)$r->enrol_timeend,
+
+                "role_id"            => (int)($r->role_id ?? 0),
+                "role_shortname"     => (string)($r->role_shortname ?? ""),
+
+                "completion_percentage" => $completion["percentage"],
+                "completion_completed"  => (int)$completion["completed"],
+                "completion_total"      => (int)$completion["total"],
 
                 // 10 user custom profile fields, stripped to Spanish.
                 // Any missing field defaults to empty string (never null).
@@ -2753,11 +2843,20 @@ class local_myddleware_external extends external_api {
                 "group_description"  => new external_value(PARAM_RAW,  "Group description (stripped to Spanish)", VALUE_OPTIONAL, ""),
                 "group_joined_at"    => new external_value(PARAM_INT,  "Timestamp when user was added to this group"),
 
-                // Enrolment context (always self/active here, kept for auditability)
-                "enrol_method"       => new external_value(PARAM_TEXT, "Always 'self' for this endpoint"),
+                // Enrolment context (active enrolments only, kept for auditability)
+                "enrol_method"       => new external_value(PARAM_TEXT, "Enrolment method (manual, self, cohort, etc.)"),
                 "enrol_timecreated"  => new external_value(PARAM_INT,  "Enrolment record created timestamp"),
                 "enrol_timestart"    => new external_value(PARAM_INT,  "Enrolment start (0 if no restriction)"),
                 "enrol_timeend"      => new external_value(PARAM_INT,  "Enrolment end (0 if no restriction)"),
+
+                // Role on the course (0/empty when no role assignment found)
+                "role_id"            => new external_value(PARAM_INT,  "Role ID on the course (0 if none)", VALUE_OPTIONAL, 0),
+                "role_shortname"     => new external_value(PARAM_TEXT, "Role shortname (student, teacher, ...)", VALUE_OPTIONAL, ""),
+
+                // Completion snapshot at enrolment detection (required activities only, criteria type 4)
+                "completion_percentage" => new external_value(PARAM_FLOAT, "Completion percentage 0-100 (required activities only)", VALUE_OPTIONAL, 0),
+                "completion_completed"  => new external_value(PARAM_INT,   "Completed required activities count", VALUE_OPTIONAL, 0),
+                "completion_total"      => new external_value(PARAM_INT,   "Total required activities count", VALUE_OPTIONAL, 0),
 
                 // User custom profile fields (hardcoded list of 10 JAA shortnames)
                 "user_cf_nacimiento"    => new external_value(PARAM_RAW,  "Date of birth (Unix timestamp string, or empty)",  VALUE_OPTIONAL, ""),
