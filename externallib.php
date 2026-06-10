@@ -2414,6 +2414,12 @@ class local_myddleware_external extends external_api {
                     "List of group IDs to fetch",
                     VALUE_REQUIRED
                 ),
+                "exclude_myddleware_origin" => new external_value(
+                    PARAM_BOOL,
+                    "If true, exclude users whose myddleware_origin custom profile field is set to 'myddleware'",
+                    VALUE_DEFAULT,
+                    false
+                ),
             ]
         );
     }
@@ -2430,14 +2436,17 @@ class local_myddleware_external extends external_api {
      * @param array $groupids Array of Moodle group IDs.
      * @return array
      */
-    public static function get_groups_with_users_progress($groupids) {
+    public static function get_groups_with_users_progress($groupids, $exclude_myddleware_origin = false) {
         global $DB, $CFG;
         require_once($CFG->libdir . "/completionlib.php");
         require_once($CFG->libdir . "/enrollib.php");
 
         $params = self::validate_parameters(
             self::get_groups_with_users_progress_parameters(),
-            ["groupids" => $groupids]
+            [
+                "groupids" => $groupids,
+                "exclude_myddleware_origin" => $exclude_myddleware_origin,
+            ]
         );
 
         $context = context_system::instance();
@@ -2469,6 +2478,21 @@ class local_myddleware_external extends external_api {
         $customfieldidtoshortname = [];
         foreach ($customfields as $cf) {
             $customfieldidtoshortname[(int)$cf->id] = $cf->shortname;
+        }
+
+        // Pre-fetch users with myddleware_origin marker if filter requested.
+        // Single query — O(1) per group iteration instead of O(N).
+        $excludedusers = [];
+        if (!empty($params["exclude_myddleware_origin"])) {
+            $exsql = "SELECT uid.userid
+                      FROM {user_info_data} uid
+                      JOIN {user_info_field} uif ON uif.id = uid.fieldid
+                      WHERE uif.shortname = 'myddleware_origin'
+                        AND uid.data = 'myddleware'";
+            $exrecords = $DB->get_records_sql($exsql);
+            foreach ($exrecords as $exr) {
+                $excludedusers[(int)$exr->userid] = true;
+            }
         }
 
         $result = [];
@@ -2559,6 +2583,16 @@ class local_myddleware_external extends external_api {
                 if (!isset($usersbyid[$uid]) ||
                     (int)$u->enrol_timecreated > (int)$usersbyid[$uid]->enrol_timecreated) {
                     $usersbyid[$uid] = $u;
+                }
+            }
+
+            // Filter out users with myddleware_origin marker if requested.
+            // Only active when exclude_myddleware_origin param is true.
+            if (!empty($params["exclude_myddleware_origin"]) && !empty($excludedusers)) {
+                foreach (array_keys($usersbyid) as $uid) {
+                    if (isset($excludedusers[$uid])) {
+                        unset($usersbyid[$uid]);
+                    }
                 }
             }
 
