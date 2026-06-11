@@ -2586,14 +2586,21 @@ class local_myddleware_external extends external_api {
                   INNER JOIN {user_info_field} midf ON midf.id = mido.fieldid
                   WHERE mido.userid = u.id
                     AND midf.shortname = 'myddleware_origin'
-                    AND mido.data = 'myddleware'
+                    AND mido.data = :markerfilter
               )
             ORDER BY gm.timeadded ASC, gm.id ASC
         ";
 
+        // Anti-loop is per-country: exclude only users created by THIS
+        // country's own Myddleware circuit (marker value = country code).
+        // Users created by another country's circuit DO qualify, enabling
+        // cross-org feeds (e.g. ROC ingesting members of ARG-implemented
+        // groups flagged roc=1). Moodle DB API forbids reusing a named
+        // param, hence the duplicated value.
         $sqlparams = [
             "timemodified"       => (int)$params["time_modified"],
             "groupcountryfilter" => $params["group_country_filter"],
+            "markerfilter"       => $params["group_country_filter"],
             "cffcomponent"       => "core_group",
         ];
 

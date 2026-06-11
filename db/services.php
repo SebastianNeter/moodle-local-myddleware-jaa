@@ -150,7 +150,7 @@ $functions = [
             'classname'   => 'local_myddleware_external',
             'methodname'  => 'get_roc_group_enrolments',
             'classpath'   => 'local/myddleware/externallib.php',
-            'description' => 'Return flat rows, one per (userid, courseid), for users who joined a group whose custom field :group_country_filter=1 (arg/roc/mex/ury/col/per) since :time_modified, any enrolment method. Excludes users whose myddleware_origin profile field is set (created by the SF->Moodle pipeline). Includes role and completion snapshot. Active non-suspended users only. Feeds the Myddleware ROC 5.x rule that pushes each new group member once to Intermediacion_a_Moodle__c in SF.',
+            'description' => 'Return flat rows, one per (userid, courseid), for users who joined a group whose custom field :group_country_filter=1 (arg/roc/mex/ury/col/per) since :time_modified, any enrolment method. Per-country anti-loop: excludes users whose myddleware_origin profile field equals :group_country_filter (created by that country own SF->Moodle circuit); users created by other countries circuits qualify, enabling cross-org feeds. Includes role and completion snapshot. Active non-suspended users only. Feeds the Myddleware 5.x rules that push each new group member once to Intermediacion_a_Moodle__c in SF.',
             'type'        => 'read',
     ],
     'local_myddleware_get_groups_with_users_progress' => [
