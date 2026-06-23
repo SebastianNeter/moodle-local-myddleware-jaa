@@ -2458,6 +2458,12 @@ class local_myddleware_external extends external_api {
                     "Group custom field shortname to filter on (arg, roc, mex, ury, col, per). Only groups where this boolean custom field = 1 are returned.",
                     VALUE_REQUIRED
                 ),
+                "ws_limit" => new external_value(
+                    PARAM_INT,
+                    "Max rows to return (0 = no limit). Paged backfill draining.",
+                    VALUE_DEFAULT,
+                    0
+                ),
             ]
         );
     }
@@ -2476,7 +2482,7 @@ class local_myddleware_external extends external_api {
      * @param string $group_country_filter  Group custom field shortname (arg/roc/mex/ury/col/per).
      * @return array
      */
-    public static function get_roc_group_enrolments($time_modified, $group_country_filter) {
+    public static function get_roc_group_enrolments($time_modified, $group_country_filter, $ws_limit = 0) {
         global $DB, $CFG;
         require_once($CFG->libdir . "/completionlib.php");
 
@@ -2485,6 +2491,7 @@ class local_myddleware_external extends external_api {
             [
                 "time_modified"        => $time_modified,
                 "group_country_filter" => $group_country_filter,
+                "ws_limit"             => $ws_limit,
             ]
         );
 
@@ -2604,7 +2611,7 @@ class local_myddleware_external extends external_api {
             "cffcomponent"       => "core_group",
         ];
 
-        $rows = $DB->get_records_sql($sql, $sqlparams);
+        $rows = $DB->get_records_sql($sql, $sqlparams, 0, (int)$params["ws_limit"]);
 
         if (empty($rows)) {
             return [];
