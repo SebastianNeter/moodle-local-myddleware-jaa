@@ -24,9 +24,9 @@
  */
 defined('MOODLE_INTERNAL') || die();
 
-$plugin->version  = 2026061004;
+$plugin->version  = 2026061005;
 $plugin->requires = 2010112401;
 $plugin->cron     = 0;
-$plugin->release = '2.5.1';
+$plugin->release = '2.5.2';
 $plugin->maturity = MATURITY_STABLE;
 $plugin->component = 'local_myddleware';

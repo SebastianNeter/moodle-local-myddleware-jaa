@@ -2464,6 +2464,12 @@ class local_myddleware_external extends external_api {
                     VALUE_DEFAULT,
                     0
                 ),
+                "skip_completion" => new external_value(
+                    PARAM_INT,
+                    "Skip per-user completion calc (0 = compute, 1 = skip and return 0). Speeds up historical backfill.",
+                    VALUE_DEFAULT,
+                    0
+                ),
             ]
         );
     }
@@ -2482,7 +2488,7 @@ class local_myddleware_external extends external_api {
      * @param string $group_country_filter  Group custom field shortname (arg/roc/mex/ury/col/per).
      * @return array
      */
-    public static function get_roc_group_enrolments($time_modified, $group_country_filter, $ws_limit = 0) {
+    public static function get_roc_group_enrolments($time_modified, $group_country_filter, $ws_limit = 0, $skip_completion = 0) {
         global $DB, $CFG;
         require_once($CFG->libdir . "/completionlib.php");
 
@@ -2492,6 +2498,7 @@ class local_myddleware_external extends external_api {
                 "time_modified"        => $time_modified,
                 "group_country_filter" => $group_country_filter,
                 "ws_limit"             => $ws_limit,
+                "skip_completion"      => $skip_completion,
             ]
         );
 
@@ -2667,6 +2674,10 @@ class local_myddleware_external extends external_api {
         $completioninfobycourse = [];
         $requiredcmidsbycourse = [];
         $completionbyuc = [];
+        // JAA: skip the per-user completion calc during fast historical backfill
+        // (skip_completion=1). The response builder defaults completion to 0; a
+        // separate ROC completion rule syncs the real progress afterwards.
+        if (empty($params["skip_completion"])) {
         foreach ($byuc as $key => $r) {
             $cid = (int)$r->course_id;
             $uid = (int)$r->user_id;
@@ -2725,6 +2736,7 @@ class local_myddleware_external extends external_api {
                 "total"      => $total,
             ];
         }
+        } // JAA: end if (!skip_completion)
 
         // Build the flat response.
         $result = [];
