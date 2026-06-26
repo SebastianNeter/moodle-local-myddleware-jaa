@@ -2002,7 +2002,11 @@ class local_myddleware_external extends external_api {
                 if ($completion->is_enabled()) {
                     $iscomplete = $completion->is_course_complete($selectedcompletion["userid"]);
                     $overallstatus = $iscomplete ? "Complete" : "Incomplete";
-                    $modinfo = get_fast_modinfo($course, $selectedcompletion["userid"]);
+                    // Course-generic modinfo (cached once per course, not rebuilt per user): the loop
+                    // counts course-level completion-tracked activities and reads each user's state via
+                    // get_data() with an explicit userid, so per-user modinfo is unused here and far
+                    // slower at scale (per-user availability gets recomputed for every student).
+                    $modinfo = get_fast_modinfo($course);
                     foreach ($modinfo->get_cms() as $cm) {
                         if ($cm->completion != COMPLETION_TRACKING_NONE) {
                             $totalactivities++;
