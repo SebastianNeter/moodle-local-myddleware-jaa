@@ -1897,6 +1897,12 @@ class local_myddleware_external extends external_api {
                     PARAM_INT, get_string("param_timemodified", "local_myddleware"), VALUE_DEFAULT, 0),
                 "country_filter" => new external_value(
                     PARAM_TEXT, "Country profile field shortname (e.g. arg, mex, col)", VALUE_REQUIRED),
+                "ws_limit" => new external_value(
+                    PARAM_INT,
+                    "Max rows to return (0 = no limit). Paged backfill draining.",
+                    VALUE_DEFAULT,
+                    0
+                ),
             ]
         );
     }
@@ -1909,14 +1915,14 @@ class local_myddleware_external extends external_api {
      * @param string $country_filter Group customfield shortname (e.g. arg, roc, mex, col, per, ury).
      * @return array with completion percentage details
      */
-    public static function get_course_completion_percentage_by_country($timemodified, $country_filter) {
+    public static function get_course_completion_percentage_by_country($timemodified, $country_filter, $ws_limit = 0) {
         global $DB, $CFG;
         require_once($CFG->libdir . "/completionlib.php");
         $returncompletions = [];
 
         $params = self::validate_parameters(
             self::get_course_completion_percentage_by_country_parameters(),
-            ["time_modified" => $timemodified, "country_filter" => $country_filter]
+            ["time_modified" => $timemodified, "country_filter" => $country_filter, "ws_limit" => $ws_limit]
         );
 
         $context = context_system::instance();
@@ -1963,7 +1969,7 @@ class local_myddleware_external extends external_api {
             "timemodified" => $params["time_modified"],
             "country_filter" => $params["country_filter"],
         ];
-        $rs = $DB->get_recordset_sql($sql, $queryparams);
+        $rs = $DB->get_recordset_sql($sql, $queryparams, 0, (int)$params["ws_limit"]);
 
         $selectedcompletions = [];
         foreach ($rs as $record) {
