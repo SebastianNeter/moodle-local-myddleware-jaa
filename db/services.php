@@ -167,6 +167,13 @@ $functions = [
             'description' => 'Return ROC groups (roc=1 AND idaccioneducativaroc non-empty), with all customfields. Dedicated to Myddleware rule 4.1 ROC.',
             'type'        => 'read',
     ],
+    'local_myddleware_create_users' => [
+            'classname'    => 'local_myddleware\\external\\create_users',
+            'methodname'   => 'execute',
+            'description'  => 'Create users like core_user_create_users, then send the branded HTML credentials email (local_adminreset).',
+            'type'         => 'write',
+            'capabilities' => 'moodle/user:create',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -194,6 +201,7 @@ $services = [
                         'local_myddleware_get_roc_group_enrolments',
                         'local_myddleware_get_groups_with_users_progress',
                         'local_myddleware_get_roc_groups_by_date',
+                        'local_myddleware_create_users',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
