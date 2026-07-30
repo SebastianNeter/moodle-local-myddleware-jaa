@@ -5,6 +5,9 @@
 // (identical validation, custom fields and events), then sends the branded HTML
 // credentials email via local_adminreset. This avoids the core plain-text email
 // that createpassword=true triggers (which arrives as raw HTML source).
+//
+// It also converts menu-type custom profile fields (e.g. genero, residencia) from
+// the plain value Myddleware sends to the exact multilang option Moodle requires.
 
 namespace local_myddleware\external;
 
@@ -48,6 +51,23 @@ class create_users extends \core_external\external_api {
             $user['password'] = $plainpassword;
             unset($user['createpassword']);
 
+            // Convert menu-type custom profile fields (e.g. genero, residencia) from the
+            // plain value Myddleware sends to the exact multilang option Moodle stores.
+            // Scoped to menu fields only; defensive so it never blocks the user creation.
+            if (!empty($user['customfields']) && is_array($user['customfields'])) {
+                foreach ($user['customfields'] as $i => $cf) {
+                    if (!isset($cf['type']) || !array_key_exists('value', $cf)) {
+                        continue;
+                    }
+                    try {
+                        $user['customfields'][$i]['value'] = self::map_menu_value($cf['type'], $cf['value']);
+                    } catch (\Throwable $e) {
+                        debugging('local_myddleware/create_users: map_menu_value failed for ' .
+                            $cf['type'] . ': ' . $e->getMessage(), DEBUG_NORMAL);
+                    }
+                }
+            }
+
             // Delegate creation to the core function: identical behaviour, no email.
             $created = \core_user_external::create_users([$user]);
             $created = json_decode(json_encode($created), true);
@@ -84,5 +104,47 @@ class create_users extends \core_external\external_api {
             $result[] = ['id' => $newid, 'username' => $username];
         }
         return $result;
+    }
+
+    /**
+     * Convert an incoming plain value to the exact option string Moodle expects for
+     * a custom profile field of type "menu" whose options are multilang ({mlang}
+     * blocks). Matches the value against every language label of every option,
+     * case-insensitively. Returns the value UNCHANGED for non-menu fields or when
+     * there is no confident match, so it can never alter another field or break
+     * the user creation.
+     *
+     * @param string $shortname custom field shortname (the WS 'type')
+     * @param mixed $value incoming plain value
+     * @return string the exact option (mlang block) or the original value
+     */
+    private static function map_menu_value($shortname, $value): string {
+        global $DB;
+        $value = (string) $value;
+        if (trim($value) === '') {
+            return $value;
+        }
+        $field = $DB->get_record('user_info_field',
+            ['shortname' => $shortname], 'id, datatype, param1');
+        if (!$field || $field->datatype !== 'menu') {
+            return $value; // only menu fields are touched
+        }
+        $needle = \core_text::strtolower(trim($value));
+        foreach (preg_split('/\r\n|\r|\n/', (string) $field->param1) as $option) {
+            $option = trim($option);
+            if ($option === '') {
+                continue;
+            }
+            if (preg_match_all('/\{mlang\s+[\w-]+\}(.*?)\{mlang\}/s', $option, $labels)) {
+                foreach ($labels[1] as $label) {
+                    if (\core_text::strtolower(trim($label)) === $needle) {
+                        return $option;
+                    }
+                }
+            } else if (\core_text::strtolower($option) === $needle) {
+                return $option;
+            }
+        }
+        return $value; // no confident match: leave as-is (same behaviour as today)
     }
 }
