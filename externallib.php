@@ -1721,6 +1721,11 @@ class local_myddleware_external extends external_api {
         $context = context_system::instance();
         self::validate_context($context);
 
+        // Unified percentage semantics: when the local_myddleware/percentage_required_only
+        // flag is enabled, only activities ticked as course completion criteria
+        // (criteriatype 4) count towards the percentage. Default keeps legacy counting.
+        $requiredonly = (bool)get_config('local_myddleware', 'percentage_required_only');
+
         // Get the last module completion id for the user/course ids.
         if (!empty($params['userid_courseid'])) {
             $sql = "
@@ -1794,10 +1799,31 @@ class local_myddleware_external extends external_api {
                         $iscomplete = $completion->is_course_complete($selectedcompletion['userid']);
                         $overallstatus = $iscomplete ? 'Complete' : 'Incomplete';
 
+                        $requiredcmidsmap = null;
+                        if ($requiredonly) {
+                            $requiredcmids = $DB->get_fieldset_select(
+                                'course_completion_criteria',
+                                'moduleinstance',
+                                'course = :courseid AND criteriatype = 4',
+                                ['courseid' => $selectedcompletion['courseid']]
+                            );
+                            if (empty($requiredcmids)) {
+                                // No completion criteria configured: skip the record entirely so the
+                                // integration keeps the last synced value instead of writing zeros.
+                                debugging('local_myddleware: course ' . $selectedcompletion['courseid'] .
+                                    ' has no activity completion criteria; completion sync skipped.',
+                                    DEBUG_DEVELOPER);
+                                continue;
+                            }
+                            $requiredcmidsmap = array_flip($requiredcmids);
+                        }
                         // Get all activities with completion tracking.
                         $modinfo = get_fast_modinfo($course, $selectedcompletion['userid']);
 
                         foreach ($modinfo->get_cms() as $cm) {
+                            if ($requiredonly && !isset($requiredcmidsmap[$cm->id])) {
+                                continue;
+                            }
                             // Only count activities that have completion tracking enabled.
                             if ($cm->completion != COMPLETION_TRACKING_NONE) {
                                 $totalactivities++;
@@ -1928,6 +1954,13 @@ class local_myddleware_external extends external_api {
         $context = context_system::instance();
         self::validate_context($context);
 
+        // Unified percentage semantics: when the local_myddleware/percentage_required_only
+        // flag is enabled, only activities ticked as course completion criteria
+        // (criteriatype 4 = activity completion) count towards the percentage, matching
+        // get_groups_with_users_progress. Default (flag off/absent) keeps legacy counting.
+        $requiredonly = (bool)get_config("local_myddleware", "percentage_required_only");
+        $requiredcmidsbycourse = [];
+
         // Filter by group customfield instead of user profile field:
         // a completion is included only when the user is a member of a group, in the SAME
         // course as the completion, that has the customfield <country_filter> set to '1'.
@@ -2002,12 +2035,38 @@ class local_myddleware_external extends external_api {
                 if ($completion->is_enabled()) {
                     $iscomplete = $completion->is_course_complete($selectedcompletion["userid"]);
                     $overallstatus = $iscomplete ? "Complete" : "Incomplete";
+                    $requiredcmidsmap = null;
+                    if ($requiredonly) {
+                        $completioncourseid = (int)$selectedcompletion["courseid"];
+                        if (!array_key_exists($completioncourseid, $requiredcmidsbycourse)) {
+                            $requiredcmids = $DB->get_fieldset_select(
+                                "course_completion_criteria",
+                                "moduleinstance",
+                                "course = :courseid AND criteriatype = 4",
+                                ["courseid" => $completioncourseid]
+                            );
+                            $requiredcmidsbycourse[$completioncourseid] =
+                                empty($requiredcmids) ? [] : array_flip($requiredcmids);
+                        }
+                        $requiredcmidsmap = $requiredcmidsbycourse[$completioncourseid];
+                        if (empty($requiredcmidsmap)) {
+                            // No completion criteria configured: skip the record entirely so the
+                            // integration keeps the last synced value instead of writing zeros.
+                            debugging("local_myddleware: course " . $completioncourseid .
+                                " has no activity completion criteria; completion sync skipped.",
+                                DEBUG_DEVELOPER);
+                            continue;
+                        }
+                    }
                     // Course-generic modinfo (cached once per course, not rebuilt per user): the loop
                     // counts course-level completion-tracked activities and reads each user's state via
                     // get_data() with an explicit userid, so per-user modinfo is unused here and far
                     // slower at scale (per-user availability gets recomputed for every student).
                     $modinfo = get_fast_modinfo($course);
                     foreach ($modinfo->get_cms() as $cm) {
+                        if ($requiredonly && !isset($requiredcmidsmap[$cm->id])) {
+                            continue;
+                        }
                         if ($cm->completion != COMPLETION_TRACKING_NONE) {
                             $totalactivities++;
                             $completiondata = $completion->get_data($cm, false, $selectedcompletion["userid"]);
