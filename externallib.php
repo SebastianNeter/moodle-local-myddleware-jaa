@@ -2575,9 +2575,9 @@ class local_myddleware_external extends external_api {
         self::validate_context($context);
         require_capability("moodle/user:viewdetails", $context);
 
-        // The 10 user custom profile field shortnames that JAA exposes as
+        // The user custom profile field shortnames that JAA exposes as
         // dedicated columns (user_cf_<shortname>). Matches the rows in
-        // mdl_user_info_field as of 2026-04-20.
+        // mdl_user_info_field as of 2026-09-23.
         $usercfshortnames = [
             "nacimiento",
             "arg",
@@ -2589,6 +2589,7 @@ class local_myddleware_external extends external_api {
             "col",
             "per",
             "sf_contact_id",
+            "telefono",
         ];
 
         $sql = "
@@ -2735,6 +2736,38 @@ class local_myddleware_external extends external_api {
             }
         }
 
+        // Batch-fetch campaign attribution (UTMs) written by the course landing
+        // plugin. One row per landing entry, so a user may have several over
+        // time; rows without any UTM value are ignored and the EARLIEST
+        // remaining row wins, matching the first-touch model (the Salesforce
+        // record is created once, when the member joins the group, and is not
+        // updated afterwards). Keyed by userid_courseid_groupid.
+        $utmbykey = [];
+        if (!empty($userids)) {
+            list($utmuseridsql, $utmuseridparams) = $DB->get_in_or_equal(
+                $userids, SQL_PARAMS_NAMED, "lu");
+            $utmsql = "
+                SELECT la.id, la.userid, la.courseid, la.groupid,
+                       la.utm_source, la.utm_medium, la.utm_campaign
+                FROM {local_course_landing_attr} la
+                WHERE la.userid $utmuseridsql
+                  AND (la.utm_source <> '' OR la.utm_medium <> '' OR la.utm_campaign <> '')
+                ORDER BY la.timecreated ASC, la.id ASC
+            ";
+            try {
+                $utmrecords = $DB->get_records_sql($utmsql, $utmuseridparams);
+                foreach ($utmrecords as $ur) {
+                    $utmkey = (int)$ur->userid . "_" . (int)$ur->courseid . "_" . (int)$ur->groupid;
+                    if (!isset($utmbykey[$utmkey])) {
+                        $utmbykey[$utmkey] = $ur;
+                    }
+                }
+            } catch (Exception $e) {
+                // The landing plugin may be absent: campaign attribution is optional.
+                $utmbykey = [];
+            }
+        }
+
         // Completion per (user, course) — counts ONLY activities required for
         // course completion (criteria type 4), same policy as
         // get_groups_with_users_progress. Cheap here because the by-date SQL
@@ -2815,6 +2848,7 @@ class local_myddleware_external extends external_api {
 
             $cfvalues = $customfieldsbyuser[$uid] ?? [];
             $completion = $completionbyuc[$key] ?? ["percentage" => 0, "completed" => 0, "total" => 0];
+            $utm = $utmbykey[$uid . "_" . $cid . "_" . (int)$r->group_id] ?? null;
 
             $row = [
                 "id"                 => (int)$r->id,
@@ -2880,6 +2914,13 @@ class local_myddleware_external extends external_api {
                 "user_cf_col"           => self::strip_mlang_to_spanish($cfvalues["col"]           ?? ""),
                 "user_cf_per"           => self::strip_mlang_to_spanish($cfvalues["per"]           ?? ""),
                 "user_cf_sf_contact_id" => self::strip_mlang_to_spanish($cfvalues["sf_contact_id"] ?? ""),
+                "user_cf_telefono"      => self::strip_mlang_to_spanish($cfvalues["telefono"]      ?? ""),
+
+                // Campaign attribution; empty when the member did not arrive
+                // through a course landing page.
+                "utm_source"            => (string)($utm->utm_source   ?? ""),
+                "utm_medium"            => (string)($utm->utm_medium   ?? ""),
+                "utm_campaign"          => (string)($utm->utm_campaign ?? ""),
             ];
 
             $result[] = $row;
@@ -2953,7 +2994,7 @@ class local_myddleware_external extends external_api {
                 "completion_completed"  => new external_value(PARAM_INT,   "Completed required activities count", VALUE_OPTIONAL, 0),
                 "completion_total"      => new external_value(PARAM_INT,   "Total required activities count", VALUE_OPTIONAL, 0),
 
-                // User custom profile fields (hardcoded list of 10 JAA shortnames)
+                // User custom profile fields (hardcoded list of JAA shortnames)
                 "user_cf_nacimiento"    => new external_value(PARAM_RAW,  "Date of birth (Unix timestamp string, or empty)",  VALUE_OPTIONAL, ""),
                 "user_cf_arg"           => new external_value(PARAM_RAW,  "Flag ARG (checkbox: '1' or '0' or '')",            VALUE_OPTIONAL, ""),
                 "user_cf_genero"        => new external_value(PARAM_RAW,  "Gender (menu value, stripped to Spanish)",         VALUE_OPTIONAL, ""),
@@ -2964,6 +3005,12 @@ class local_myddleware_external extends external_api {
                 "user_cf_col"           => new external_value(PARAM_RAW,  "Flag COL",                                         VALUE_OPTIONAL, ""),
                 "user_cf_per"           => new external_value(PARAM_RAW,  "Flag PER",                                         VALUE_OPTIONAL, ""),
                 "user_cf_sf_contact_id" => new external_value(PARAM_RAW,  "Salesforce Contact ID (text)",                     VALUE_OPTIONAL, ""),
+                "user_cf_telefono"      => new external_value(PARAM_RAW,  "Mobile phone (text)",                              VALUE_OPTIONAL, ""),
+
+                // Campaign attribution from the course landing plugin (empty when absent)
+                "utm_source"            => new external_value(PARAM_RAW,  "Campaign source (utm_source)",     VALUE_OPTIONAL, ""),
+                "utm_medium"            => new external_value(PARAM_RAW,  "Campaign medium (utm_medium)",     VALUE_OPTIONAL, ""),
+                "utm_campaign"          => new external_value(PARAM_RAW,  "Campaign name (utm_campaign)",     VALUE_OPTIONAL, ""),
             ])
         );
     }
