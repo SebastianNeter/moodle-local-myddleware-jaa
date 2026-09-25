@@ -3308,4 +3308,514 @@ class local_myddleware_external extends external_api {
             "warnings" => new external_warnings(),
         ]);
     }
+
+    /**
+     * Batch-resolves which of the given users hold a STUDENT-archetype role
+     * assignment at each course's context, per the "only Moodle STUDENT role
+     * counts" rule (spec SYNC-2, cross-cutting rule in spec.md): a user
+     * counts as a student in a course only if they hold a role assignment
+     * there whose archetype is "student" AND hold no role assignment whose
+     * archetype is "editingteacher", "teacher", "manager", or "coursecreator"
+     * -- at the course context itself, OR at any ancestor context (course
+     * category, any level up, or the system context). "role.archetype" is a
+     * real column on Moodle's core {role} table, so this needs no
+     * get_archetype_roles() call and no per-user query.
+     *
+     * @param int[] $courseids
+     * @param int[] $userids
+     * @return array [courseid => [userid => true]] userids that are students there
+     */
+    private static function resolve_student_course_users(array $courseids, array $userids) {
+        global $DB;
+
+        if (empty($courseids) || empty($userids)) {
+            return [];
+        }
+
+        $excludedarchetypes = ["editingteacher", "teacher", "manager", "coursecreator"];
+
+        [$coursesql, $courseparams] = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, "crs");
+        [$usersql, $userparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED, "usr");
+        $sql = "SELECT ra.id, c.id AS courseid, ra.userid, r.archetype
+                  FROM {role_assignments} ra
+                  JOIN {context} cx ON cx.id = ra.contextid AND cx.contextlevel = :ctxlevel
+                  JOIN {course} c ON c.id = cx.instanceid
+                  JOIN {role} r ON r.id = ra.roleid
+                 WHERE c.id $coursesql AND ra.userid $usersql";
+        $sqlparams = $courseparams + $userparams + ["ctxlevel" => CONTEXT_COURSE];
+
+        $archetypesbycourseuser = [];
+        foreach ($DB->get_records_sql($sql, $sqlparams) as $row) {
+            $archetypesbycourseuser[$row->courseid][$row->userid][] = $row->archetype;
+        }
+
+        // W5: a user holding an excluded archetype at a COURSE CATEGORY
+        // (any ancestor level) or SYSTEM context must also be excluded, even
+        // though the "student" check itself stays course-context-only. Read
+        // each course context's "path" directly (system/.../category/.../
+        // course) instead of calling context_course::instance() per course,
+        // to keep this batched at one query.
+        [$courseinsql, $courseinparams] = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, "ctxcrs");
+        $coursecontexts = $DB->get_records_select(
+            "context", "contextlevel = :ctxlevel AND instanceid $courseinsql",
+            $courseinparams + ["ctxlevel" => CONTEXT_COURSE], "", "id, instanceid, path");
+
+        $ancestorctxbycourse = [];
+        $allancestorctx = [];
+        foreach ($coursecontexts as $coursecontext) {
+            // $coursecontext->path is e.g. "/1/3/7/25", where 25 is this
+            // course context's own id (always the last segment) and
+            // everything before it is the system + category ancestry.
+            $segments = array_filter(explode("/", trim($coursecontext->path, "/")), "strlen");
+            array_pop($segments); // Drop the course context's own id.
+            $ancestorids = array_map("intval", $segments);
+            $ancestorctxbycourse[$coursecontext->instanceid] = $ancestorids;
+            foreach ($ancestorids as $ctxid) {
+                $allancestorctx[$ctxid] = true;
+            }
+        }
+
+        $excludedbycontextuser = [];
+        if (!empty($allancestorctx)) {
+            [$actxsql, $actxparams] = $DB->get_in_or_equal(array_keys($allancestorctx), SQL_PARAMS_NAMED, "actx");
+            [$aarchsql, $aarchparams] = $DB->get_in_or_equal($excludedarchetypes, SQL_PARAMS_NAMED, "aarch");
+            $ancestorsql = "SELECT ra.id, ra.contextid, ra.userid, r.archetype
+                               FROM {role_assignments} ra
+                               JOIN {role} r ON r.id = ra.roleid
+                              WHERE ra.contextid $actxsql AND ra.userid $usersql AND r.archetype $aarchsql";
+            $ancestorparams = $actxparams + $userparams + $aarchparams;
+            foreach ($DB->get_records_sql($ancestorsql, $ancestorparams) as $row) {
+                $excludedbycontextuser[$row->contextid][$row->userid] = true;
+            }
+        }
+
+        $studentsbycourse = [];
+        foreach ($archetypesbycourseuser as $courseid => $archetypesbyuser) {
+            $ancestorctx = $ancestorctxbycourse[$courseid] ?? [];
+            foreach ($archetypesbyuser as $userid => $archetypes) {
+                if (!in_array("student", $archetypes, true) || array_intersect($archetypes, $excludedarchetypes)) {
+                    continue;
+                }
+                $excludedatancestor = false;
+                foreach ($ancestorctx as $ctxid) {
+                    if (!empty($excludedbycontextuser[$ctxid][$userid])) {
+                        $excludedatancestor = true;
+                        break;
+                    }
+                }
+                if (!$excludedatancestor) {
+                    $studentsbycourse[$courseid][(int)$userid] = true;
+                }
+            }
+        }
+        return $studentsbycourse;
+    }
+
+    /**
+     * Batch-resolves the group memberships of each user in each course, for
+     * the "group ids of the user in that course" response field. Returns
+     * ALL groups, not just "arg" ones -- the caller already has "arg" per
+     * group from get_prepost_courses and is expected to filter there, same
+     * rationale as that function's own "all groups, filter client-side"
+     * contract.
+     *
+     * @param int[] $courseids
+     * @param int[] $userids
+     * @return array [courseid => [userid => int[] groupids]]
+     */
+    private static function resolve_course_group_ids(array $courseids, array $userids) {
+        global $DB;
+
+        if (empty($courseids) || empty($userids)) {
+            return [];
+        }
+
+        [$coursesql, $courseparams] = $DB->get_in_or_equal($courseids, SQL_PARAMS_NAMED, "gcrs");
+        [$usersql, $userparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED, "gusr");
+        $sql = "SELECT gm.id, g.courseid, gm.userid, gm.groupid
+                  FROM {groups_members} gm
+                  JOIN {groups} g ON g.id = gm.groupid
+                 WHERE g.courseid $coursesql AND gm.userid $usersql";
+
+        $groupidsbycourseuser = [];
+        foreach ($DB->get_records_sql($sql, $courseparams + $userparams) as $row) {
+            $groupidsbycourseuser[$row->courseid][$row->userid][] = (int)$row->groupid;
+        }
+        return $groupidsbycourseuser;
+    }
+
+    /**
+     * Batch-reads every per-type answer table mod_questionnaire uses (Yes/No,
+     * free text, single-choice, multiple-choice, rank, date) for a set of
+     * response ids, instead of one query per response per question. The
+     * "questionnaire_response_file" (file upload) and
+     * "questionnaire_response_other" ("write your own option" free text
+     * attached to a choice) tables are intentionally NOT read in this
+     * version -- see docs/API_get_prepost_responses_by_date.md.
+     *
+     * @param int[] $responseids
+     * @return array [responseid => array of {question_id, choice_id, value, text, rank}]
+     */
+    private static function resolve_response_answers(array $responseids) {
+        global $DB;
+
+        $answers = [];
+        if (empty($responseids)) {
+            return $answers;
+        }
+
+        [$insql, $inparams] = $DB->get_in_or_equal($responseids, SQL_PARAMS_NAMED);
+
+        // response_bool.choice_id is NOT a real choice id: mod_questionnaire
+        // stores the Yes/No answer itself there, as the char "y" or "n".
+        foreach ($DB->get_records_select("questionnaire_response_bool", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, choice_id") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => null,
+                "value" => $row->choice_id, "text" => null, "rank" => null,
+            ];
+        }
+
+        foreach ($DB->get_records_select("questionnaire_response_text", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, response") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => null,
+                "value" => null, "text" => $row->response, "rank" => null,
+            ];
+        }
+
+        foreach ($DB->get_records_select("questionnaire_response_date", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, response") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => null,
+                "value" => null, "text" => $row->response, "rank" => null,
+            ];
+        }
+
+        foreach ($DB->get_records_select("questionnaire_resp_single", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, choice_id") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => (int)$row->choice_id,
+                "value" => null, "text" => null, "rank" => null,
+            ];
+        }
+
+        foreach ($DB->get_records_select("questionnaire_resp_multiple", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, choice_id") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => (int)$row->choice_id,
+                "value" => null, "text" => null, "rank" => null,
+            ];
+        }
+
+        foreach ($DB->get_records_select("questionnaire_response_rank", "response_id $insql", $inparams,
+                "response_id ASC, question_id ASC", "id, response_id, question_id, choice_id, rankvalue") as $row) {
+            $answers[$row->response_id][] = [
+                "question_id" => (int)$row->question_id, "choice_id" => (int)$row->choice_id,
+                "value" => null, "text" => null, "rank" => (int)$row->rankvalue,
+            ];
+        }
+
+        return $answers;
+    }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_prepost_responses_by_date_parameters() {
+        return new external_function_parameters([
+            "questionnaireids" => new external_multiple_structure(
+                new external_value(PARAM_INT, "Questionnaire course module ID (cmid)"),
+                "List of questionnaire cmids to fetch responses for",
+                VALUE_REQUIRED
+            ),
+            "time_modified" => new external_value(
+                PARAM_INT,
+                "Returns responses whose \"submitted\" timestamp is strictly greater than this cursor " .
+                "(0 = no filter). \"submitted\" only has 1-second granularity, so clients must advance " .
+                "the cursor to (max \"submitted\" value seen in the response payload) - 1, and dedupe " .
+                "results on \"responseid\" across calls -- otherwise a response committed in the same " .
+                "second as the last row read, but after it, is skipped forever.",
+                VALUE_DEFAULT, 0),
+            "limit" => new external_value(
+                PARAM_INT,
+                "Max RAW rows read per page, before the student-role filter (default 500, max 2000, " .
+                "clamped server-side)",
+                VALUE_DEFAULT, 500),
+            "offset" => new external_value(
+                PARAM_INT,
+                "Paging offset over the RAW (pre-role-filter) result set -- advance by \"next_offset\", " .
+                "not by \"returned\" (see the function docblock)",
+                VALUE_DEFAULT, 0),
+            "include_incomplete" => new external_value(
+                PARAM_BOOL,
+                "Include responses where complete = false (default: only complete responses are returned)",
+                VALUE_DEFAULT, false),
+        ]);
+    }
+
+    /**
+     * Returns STUDENT-role responses (see resolve_student_course_users()) of
+     * the requested questionnaires, incrementally by "submitted" timestamp,
+     * with answers merged in from every per-type answer table mod_questionnaire
+     * uses.
+     *
+     * Pagination is over the RAW result set, BEFORE the student-role filter:
+     * "next_offset" always advances by the number of raw rows read this call
+     * (up to "limit"), never by the number of student rows actually returned
+     * in "responses". "read" exposes that raw-rows-read count directly
+     * (read == next_offset - offset), so callers do not have to compute it
+     * themselves. This keeps paging correct and terminating even when a page
+     * happens to contain mostly non-student rows (e.g. a course with many
+     * teachers). Callers keep paging (offset = next_offset) while "read"
+     * equals "limit"; "read" < "limit" means pagination is complete. "total"
+     * counts all rows matching time_modified/complete BEFORE the
+     * student-role filter, for the same reason -- it is a page-sizing hint,
+     * not the count of items the caller will actually receive. Offset-based
+     * paging can skip a row if an earlier, already-counted response is
+     * deleted between two paging calls; this is a known, documented
+     * limitation (see docs/API_get_prepost_responses_by_date.md).
+     *
+     * @param array $questionnaireids Course module IDs (cmids).
+     * @param int $timemodified
+     * @param int $limit
+     * @param int $offset
+     * @param bool $includeincomplete
+     * @return array
+     */
+    public static function get_prepost_responses_by_date(
+            $questionnaireids, $timemodified = 0, $limit = 500, $offset = 0, $includeincomplete = false) {
+        global $DB;
+
+        $params = self::validate_parameters(self::get_prepost_responses_by_date_parameters(), [
+            "questionnaireids" => $questionnaireids,
+            "time_modified" => $timemodified,
+            "limit" => $limit,
+            "offset" => $offset,
+            "include_incomplete" => $includeincomplete,
+        ]);
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // mod_questionnaire may not be installed; every query below would
+        // otherwise fatal with a dml_read_exception on a missing table.
+        if (!$DB->get_manager()->table_exists('questionnaire')) {
+            return [
+                "total" => 0, "returned" => 0, "next_offset" => (int)$params["offset"], "read" => 0,
+                "responses" => [],
+                "warnings" => [[
+                    "item" => "questionnaire", "itemid" => 0,
+                    "warningcode" => "moduleunavailable",
+                    "message" => "mod_questionnaire is not installed on this Moodle site.",
+                ]],
+            ];
+        }
+
+        $limit = max(1, min(2000, (int)$params["limit"]));
+        $offset = max(0, (int)$params["offset"]);
+
+        $warnings = [];
+        $instancemap = []; // instanceid => ['cmid' => int, 'courseid' => int, 'anonymous' => bool].
+        foreach ($params["questionnaireids"] as $cmid) {
+            // Validate the cmid actually belongs to a questionnaire module,
+            // same rationale as get_prepost_questions.
+            $cm = get_coursemodule_from_id('questionnaire', $cmid, 0, false, IGNORE_MISSING);
+            if (!$cm) {
+                $warnings[] = [
+                    "item" => "questionnaire", "itemid" => $cmid,
+                    "warningcode" => "cmnotfound", "message" => "Course module not found",
+                ];
+                continue;
+            }
+            // get_coursemodule_from_id() already JOINs {questionnaire} to
+            // resolve $cm->instance, so a truthy $cm guarantees this row
+            // exists; MUST_EXIST documents that invariant instead of
+            // re-checking it with an unreachable "instancenotfound" warning
+            // branch. Reads "respondenttype" here too (C3): mod_questionnaire
+            // never masks the stored userid for anonymous questionnaires --
+            // it only hides identity in its own UI -- so this WS must do the
+            // masking itself.
+            $questionnaire = $DB->get_record(
+                'questionnaire', ['id' => $cm->instance], 'id, respondenttype', MUST_EXIST);
+            $instancemap[$cm->instance] = [
+                "cmid" => (int)$cmid,
+                "courseid" => (int)$cm->course,
+                "anonymous" => ($questionnaire->respondenttype === 'anonymous'),
+            ];
+        }
+
+        if (empty($instancemap)) {
+            return ["total" => 0, "returned" => 0, "next_offset" => $offset, "read" => 0, "responses" => [],
+                "warnings" => $warnings];
+        }
+
+        [$instancesql, $selectparams] = $DB->get_in_or_equal(array_keys($instancemap), SQL_PARAMS_NAMED);
+        $select = "questionnaireid $instancesql AND submitted > :timemodified";
+        $selectparams["timemodified"] = $params["time_modified"];
+        if (empty($params["include_incomplete"])) {
+            $select .= " AND complete = :complete";
+            $selectparams["complete"] = "y";
+        }
+
+        // "total" is recomputed on every page call (not just offset == 0) so
+        // it always reflects the current server-side state, including rows
+        // inserted or deleted by other actors between pages; callers that
+        // only need it once may simply ignore it after the first page. This
+        // trades one extra COUNT query per call for that consistency.
+        $total = $DB->count_records_select("questionnaire_response", $select, $selectparams);
+        $rawresponses = $DB->get_records_select(
+            "questionnaire_response", $select, $selectparams, "submitted ASC, id ASC",
+            "id, questionnaireid, userid, submitted, complete", $offset, $limit);
+        $rawread = count($rawresponses);
+        $nextoffset = $offset + $rawread;
+
+        if (empty($rawresponses)) {
+            return ["total" => $total, "returned" => 0, "next_offset" => $nextoffset, "read" => $rawread,
+                "responses" => [], "warnings" => $warnings];
+        }
+
+        // Batch-resolve which raw rows belong to a STUDENT-role user in
+        // their response's course (spec SYNC-2), instead of one role query
+        // per response.
+        $courseidsraw = [];
+        $useridsraw = [];
+        foreach ($rawresponses as $r) {
+            $courseidsraw[$instancemap[$r->questionnaireid]["courseid"]] = true;
+            $useridsraw[(int)$r->userid] = true;
+        }
+        $studentsbycourse = self::resolve_student_course_users(array_keys($courseidsraw), array_keys($useridsraw));
+
+        $studentresponses = [];
+        foreach ($rawresponses as $r) {
+            $courseid = $instancemap[$r->questionnaireid]["courseid"];
+            // W4: $studentsbycourse[$courseid] is a userid-keyed set
+            // (userid => true), so this is an O(1) isset() lookup, not an
+            // in_array() scan of a list.
+            if (isset($studentsbycourse[$courseid][(int)$r->userid])) {
+                $studentresponses[] = $r;
+            }
+        }
+
+        if (empty($studentresponses)) {
+            return ["total" => $total, "returned" => 0, "next_offset" => $nextoffset, "read" => $rawread,
+                "responses" => [], "warnings" => $warnings];
+        }
+
+        $responseids = [];
+        $useridskeyed = [];
+        $courseidskeyed = [];
+        foreach ($studentresponses as $r) {
+            $responseids[] = (int)$r->id;
+            $useridskeyed[(int)$r->userid] = true;
+            $courseidskeyed[$instancemap[$r->questionnaireid]["courseid"]] = true;
+        }
+        $userids = array_keys($useridskeyed);
+        $courseids = array_keys($courseidskeyed);
+
+        // One batched query each for user identity, group membership and
+        // answers, instead of one query per response. "deleted = 0" keeps a
+        // deleted Moodle account from surfacing a stale username/email.
+        [$useridsql, $useridparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED, "uid");
+        $users = $DB->get_records_select(
+            "user", "id $useridsql AND deleted = 0", $useridparams, "", "id, username, email");
+        $groupidsbycourseuser = self::resolve_course_group_ids($courseids, $userids);
+        $answersbyresponse = self::resolve_response_answers($responseids);
+
+        $result = [];
+        foreach ($studentresponses as $r) {
+            $courseid = $instancemap[$r->questionnaireid]["courseid"];
+            $userid = (int)$r->userid;
+            $user = $users[$userid] ?? null;
+            $anonymous = $instancemap[$r->questionnaireid]["anonymous"];
+            $result[] = [
+                "responseid" => (int)$r->id,
+                "cmid" => $instancemap[$r->questionnaireid]["cmid"],
+                "questionnaireid" => (int)$r->questionnaireid,
+                "userid" => $userid,
+                // C3: mod_questionnaire stores the real userid unconditionally
+                // and only masks identity in its own UI, so this WS must mask
+                // it itself when the questionnaire's respondenttype is
+                // "anonymous" -- otherwise it leaks identity Moodle promised
+                // to hide.
+                "username" => $anonymous ? null : ($user->username ?? ""),
+                "email" => $anonymous ? null : ($user->email ?? ""),
+                "anonymous" => $anonymous,
+                "submitted" => (int)$r->submitted,
+                "complete" => ($r->complete === "y"),
+                "courserole" => "student",
+                "groupids" => $groupidsbycourseuser[$courseid][$userid] ?? [],
+                "answers" => $answersbyresponse[$r->id] ?? [],
+            ];
+        }
+
+        return ["total" => $total, "returned" => count($result), "next_offset" => $nextoffset,
+            "read" => $rawread, "responses" => $result, "warnings" => $warnings];
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_prepost_responses_by_date_returns() {
+        return new external_single_structure([
+            "total" => new external_value(PARAM_INT,
+                "Count of responses matching time_modified/complete BEFORE the student-role filter " .
+                "-- a page-sizing hint, not the count of items actually returned"),
+            "returned" => new external_value(PARAM_INT, "Number of student-role responses in \"responses\""),
+            "next_offset" => new external_value(PARAM_INT,
+                "Offset to request next call. Advances by RAW rows read this call, not by \"returned\""),
+            "read" => new external_value(PARAM_INT,
+                "Raw rows actually read this call (== next_offset - offset). Equals \"limit\" while more " .
+                "pages remain; fewer than \"limit\" means pagination is complete"),
+            "responses" => new external_multiple_structure(
+                new external_single_structure([
+                    "responseid" => new external_value(PARAM_INT, "Moodle response ID"),
+                    "cmid" => new external_value(PARAM_INT, "Questionnaire course module ID"),
+                    "questionnaireid" => new external_value(PARAM_INT, "mod_questionnaire instance ID"),
+                    "userid" => new external_value(PARAM_INT, "Moodle user ID"),
+                    "username" => new external_value(
+                        PARAM_RAW,
+                        "Moodle username -- the app hashes this at sync time, never stores it raw. Null when " .
+                        "\"anonymous\" is true",
+                        VALUE_REQUIRED, null, NULL_ALLOWED),
+                    "email" => new external_value(
+                        PARAM_RAW,
+                        "User email -- the app hashes this at sync time, never stores it raw. Null when " .
+                        "\"anonymous\" is true",
+                        VALUE_REQUIRED, null, NULL_ALLOWED),
+                    "anonymous" => new external_value(PARAM_BOOL,
+                        "True when the questionnaire's respondenttype is \"anonymous\" -- \"username\" and " .
+                        "\"email\" are null and this response cannot be identity-paired with another"),
+                    "submitted" => new external_value(PARAM_INT, "Unix timestamp"),
+                    "complete" => new external_value(PARAM_BOOL, "Whether the response was submitted as complete"),
+                    "courserole" => new external_value(
+                        PARAM_TEXT, "Always \"student\" -- only STUDENT-archetype responses are ever returned"),
+                    "groupids" => new external_multiple_structure(
+                        new external_value(PARAM_INT, "Group ID"),
+                        "Groups the user belongs to in this response's course"
+                    ),
+                    "answers" => new external_multiple_structure(
+                        new external_single_structure([
+                            "question_id" => new external_value(PARAM_INT, "Moodle question ID"),
+                            "choice_id" => new external_value(
+                                PARAM_INT, "Selected choice ID (single/multiple/rank question types)",
+                                VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "value" => new external_value(
+                                PARAM_RAW, "\"y\" or \"n\" (Yes/No question type only)",
+                                VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "text" => new external_value(
+                                PARAM_RAW, "Free-text or date answer", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "rank" => new external_value(
+                                PARAM_INT, "Rank value (Rate/scale question type only)",
+                                VALUE_OPTIONAL, null, NULL_ALLOWED),
+                        ])
+                    ),
+                ])
+            ),
+            "warnings" => new external_warnings(),
+        ]);
+    }
 }

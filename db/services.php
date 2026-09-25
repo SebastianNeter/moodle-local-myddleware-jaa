@@ -174,6 +174,13 @@ $functions = [
             'description' => 'Return non-deleted questions and choices of the requested questionnaires. Used by the PrePost platform question-master mapping.',
             'type'        => 'read',
     ],
+    'local_myddleware_get_prepost_responses_by_date' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_prepost_responses_by_date',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return STUDENT-role responses of the requested questionnaires with their answers, incrementally by submission date. Used by the PrePost platform sync.',
+            'type'        => 'read',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -202,6 +209,7 @@ $services = [
                         'local_myddleware_get_prepost_courses',
                         'local_myddleware_get_prepost_questionnaires',
                         'local_myddleware_get_prepost_questions',
+                        'local_myddleware_get_prepost_responses_by_date',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
