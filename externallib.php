@@ -3142,4 +3142,170 @@ class local_myddleware_external extends external_api {
             "warnings" => new external_warnings(),
         ]);
     }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_prepost_questions_parameters() {
+        return new external_function_parameters([
+            "questionnaireids" => new external_multiple_structure(
+                new external_value(PARAM_INT, "Questionnaire course module ID (cmid)"),
+                "List of questionnaire cmids to fetch questions for",
+                VALUE_REQUIRED
+            ),
+        ]);
+    }
+
+    /**
+     * Returns the non-deleted questions and choices of each requested
+     * questionnaire. "content" is the actual question text and is the field
+     * used by the question master mapping.
+     *
+     * @param array $questionnaireids Course module IDs (cmids).
+     * @return array
+     */
+    public static function get_prepost_questions($questionnaireids) {
+        global $DB;
+
+        $params = self::validate_parameters(
+            self::get_prepost_questions_parameters(),
+            ["questionnaireids" => $questionnaireids]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // mod_questionnaire may not be installed; every query below would
+        // otherwise fatal with a dml_read_exception on a missing table.
+        if (!$DB->get_manager()->table_exists('questionnaire')) {
+            return ["questions" => [], "warnings" => [[
+                "item" => "questionnaire", "itemid" => 0,
+                "warningcode" => "moduleunavailable",
+                "message" => "mod_questionnaire is not installed on this Moodle site.",
+            ]]];
+        }
+
+        // questionnaire_question_type has no "typetext" column: real columns
+        // are id, typeid, type, has_choices, response_table. It must be keyed
+        // by "typeid" (not "id") because question.type_id stores typeid, and
+        // the two diverge from typeid 8 ("Rate") onward since install.php
+        // skips typeid 7.
+        $typenames = $DB->get_records("questionnaire_question_type", null, "", "typeid, type");
+
+        $questions = [];
+        $warnings = [];
+
+        foreach ($params["questionnaireids"] as $cmid) {
+            // Validate the cmid actually belongs to a questionnaire module; a
+            // cmid from another module whose instance id happens to collide
+            // with a questionnaire id would otherwise silently return the
+            // wrong questionnaire's questions.
+            $cm = get_coursemodule_from_id('questionnaire', $cmid, 0, false, IGNORE_MISSING);
+            if (!$cm) {
+                $warnings[] = [
+                    "item" => "questionnaire", "itemid" => $cmid,
+                    "warningcode" => "cmnotfound", "message" => "Course module not found",
+                ];
+                continue;
+            }
+
+            $questionnaire = $DB->get_record("questionnaire", ["id" => $cm->instance], "id, sid", IGNORE_MISSING);
+            if (!$questionnaire || empty($questionnaire->sid)) {
+                $warnings[] = [
+                    "item" => "questionnaire", "itemid" => $cmid,
+                    "warningcode" => "surveynotfound", "message" => "Questionnaire survey not found",
+                ];
+                continue;
+            }
+
+            // "deleted" is an int timestamp (NULL = active) since upgrade.php
+            // step 1038-1050, not the legacy 'y'/'n' char flag. Type_id 99
+            // and 100 are the page-break and section-text layout rows, not
+            // real questions, and must not pollute the question master.
+            $questionrecords = $DB->get_records_select(
+                "questionnaire_question",
+                "surveyid = :surveyid AND deleted IS NULL AND type_id NOT IN (99, 100)",
+                ["surveyid" => $questionnaire->sid],
+                "position ASC, id ASC"
+            );
+
+            if (empty($questionrecords)) {
+                continue;
+            }
+
+            // One batched choices query for the whole questionnaire instead
+            // of one query per question.
+            $questionids = array_keys($questionrecords);
+            [$choicesql, $choiceparams] = $DB->get_in_or_equal($questionids, SQL_PARAMS_NAMED);
+            $allchoices = $DB->get_records_select(
+                "questionnaire_quest_choice", "question_id $choicesql", $choiceparams,
+                "question_id ASC, id ASC", "id, question_id, content, value");
+
+            $choicesbyquestion = [];
+            foreach ($allchoices as $c) {
+                $choicesbyquestion[$c->question_id][] = $c;
+            }
+
+            foreach ($questionrecords as $q) {
+                $choicelist = [];
+                $ordinal = 1;
+                foreach ($choicesbyquestion[$q->id] ?? [] as $c) {
+                    $choicelist[] = [
+                        "id" => (int)$c->id,
+                        "content" => $c->content,
+                        "value" => $c->value,
+                        "position" => $ordinal,
+                    ];
+                    $ordinal++;
+                }
+
+                $questions[] = [
+                    "questionnaireid" => (int)$cmid,
+                    "id" => (int)$q->id,
+                    "position" => (int)$q->position,
+                    "typeid" => (int)$q->type_id,
+                    "typename" => $typenames[$q->type_id]->type ?? "",
+                    "name" => (string)$q->name,
+                    "content" => $q->content,
+                    "required" => ($q->required === "y"),
+                    "choices" => $choicelist,
+                ];
+            }
+        }
+
+        return ["questions" => $questions, "warnings" => $warnings];
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_prepost_questions_returns() {
+        return new external_single_structure([
+            "questions" => new external_multiple_structure(
+                new external_single_structure([
+                    "questionnaireid" => new external_value(PARAM_INT, "Questionnaire cmid this question belongs to"),
+                    "id" => new external_value(PARAM_INT, "Moodle question ID"),
+                    "position" => new external_value(PARAM_INT, "Question order within the questionnaire"),
+                    "typeid" => new external_value(PARAM_INT, "Moodle question type ID"),
+                    "typename" => new external_value(PARAM_TEXT, "Moodle question type name"),
+                    "name" => new external_value(PARAM_TEXT, "Internal question label, usually empty"),
+                    "content" => new external_value(PARAM_RAW, "Question text (HTML) - the key field for mapping"),
+                    "required" => new external_value(PARAM_BOOL, "Whether an answer is required"),
+                    "choices" => new external_multiple_structure(
+                        new external_single_structure([
+                            "id" => new external_value(PARAM_INT, "Choice ID"),
+                            "content" => new external_value(PARAM_RAW, "Choice text"),
+                            "value" => new external_value(
+                                PARAM_RAW, "Choice value, may be empty", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            "position" => new external_value(PARAM_INT, "Ordinal position among the question choices (1-based)"),
+                        ])
+                    ),
+                ])
+            ),
+            "warnings" => new external_warnings(),
+        ]);
+    }
 }

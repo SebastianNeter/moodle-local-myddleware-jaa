@@ -167,6 +167,13 @@ $functions = [
             'description' => 'Return mod_questionnaire instances per requested course, with a deterministic ordering position. Used by the PrePost platform sync.',
             'type'        => 'read',
     ],
+    'local_myddleware_get_prepost_questions' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_prepost_questions',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return non-deleted questions and choices of the requested questionnaires. Used by the PrePost platform question-master mapping.',
+            'type'        => 'read',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -194,6 +201,7 @@ $services = [
                         'local_myddleware_get_groups_with_users_progress',
                         'local_myddleware_get_prepost_courses',
                         'local_myddleware_get_prepost_questionnaires',
+                        'local_myddleware_get_prepost_questions',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
