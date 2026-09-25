@@ -3017,4 +3017,129 @@ class local_myddleware_external extends external_api {
             "warnings" => new external_warnings(),
         ]);
     }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_prepost_questionnaires_parameters() {
+        return new external_function_parameters([
+            "courseids" => new external_multiple_structure(
+                new external_value(PARAM_INT, "Moodle course ID"),
+                "List of course IDs to fetch questionnaires for",
+                VALUE_REQUIRED
+            ),
+            "time_modified" => new external_value(
+                PARAM_INT, "Only return questionnaires modified after this timestamp (0 = no filter)",
+                VALUE_DEFAULT, 0),
+        ]);
+    }
+
+    /**
+     * Returns the mod_questionnaire instances of each requested course, with
+     * a deterministic "position" so the caller can derive pre = min position,
+     * post = max position. Does not read questionnaire internals beyond the
+     * instance table.
+     *
+     * @param array $courseids
+     * @param int $timemodified
+     * @return array
+     */
+    public static function get_prepost_questionnaires($courseids, $timemodified = 0) {
+        global $DB;
+
+        $params = self::validate_parameters(
+            self::get_prepost_questionnaires_parameters(),
+            ["courseids" => $courseids, "time_modified" => $timemodified]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        // mod_questionnaire may not be installed; every query below would
+        // otherwise fatal with a dml_read_exception on a missing table.
+        if (!$DB->get_manager()->table_exists('questionnaire')) {
+            return ["questionnaires" => [], "warnings" => [[
+                "item" => "questionnaire", "itemid" => 0,
+                "warningcode" => "moduleunavailable",
+                "message" => "mod_questionnaire is not installed on this Moodle site.",
+            ]]];
+        }
+
+        $questionnaires = [];
+        $warnings = [];
+
+        foreach ($params["courseids"] as $courseid) {
+            if (!$DB->record_exists("course", ["id" => $courseid])) {
+                $warnings[] = [
+                    "item" => "course", "itemid" => $courseid,
+                    "warningcode" => "coursenotfound", "message" => "Course not found",
+                ];
+                continue;
+            }
+
+            $modinfo = get_fast_modinfo($courseid);
+            foreach ($modinfo->get_instances_of("questionnaire") as $cm) {
+                $questionnaire = $DB->get_record("questionnaire", ["id" => $cm->instance], "*", IGNORE_MISSING);
+                if (!$questionnaire) {
+                    $warnings[] = [
+                        "item" => "questionnaire", "itemid" => $cm->id,
+                        "warningcode" => "instancenotfound", "message" => "Questionnaire instance not found",
+                    ];
+                    continue;
+                }
+
+                $itemtimemodified = (int)($questionnaire->timemodified ?? 0);
+                if (!empty($params["time_modified"]) && $itemtimemodified <= $params["time_modified"]) {
+                    continue;
+                }
+
+                $sectionnum = (int)$cm->sectionnum;
+                $sectioncms = array_values($modinfo->sections[$sectionnum] ?? []);
+                $indexinsection = array_search($cm->id, $sectioncms, true);
+                $position = $sectionnum * 1000 + ($indexinsection === false ? 0 : $indexinsection);
+
+                $questionnaires[] = [
+                    "cmid" => (int)$cm->id,
+                    "instanceid" => (int)$cm->instance,
+                    "courseid" => (int)$courseid,
+                    "name" => $cm->name,
+                    "section" => $sectionnum,
+                    "position" => $position,
+                    "opendate" => (int)($questionnaire->opendate ?? 0),
+                    "closedate" => (int)($questionnaire->closedate ?? 0),
+                    "visible" => (int)$cm->visible,
+                    "timemodified" => $itemtimemodified,
+                ];
+            }
+        }
+
+        return ["questionnaires" => $questionnaires, "warnings" => $warnings];
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_prepost_questionnaires_returns() {
+        return new external_single_structure([
+            "questionnaires" => new external_multiple_structure(
+                new external_single_structure([
+                    "cmid" => new external_value(PARAM_INT, "Course module ID; the id to pass to get_prepost_questions"),
+                    "instanceid" => new external_value(PARAM_INT, "mod_questionnaire instance ID"),
+                    "courseid" => new external_value(PARAM_INT, "Moodle course ID"),
+                    "name" => new external_value(PARAM_TEXT, "Questionnaire activity name"),
+                    "section" => new external_value(PARAM_INT, "Course section number"),
+                    "position" => new external_value(
+                        PARAM_INT, "section*1000 + index within section. Min = pre, max = post"),
+                    "opendate" => new external_value(PARAM_INT, "Unix timestamp, 0 = no restriction"),
+                    "closedate" => new external_value(PARAM_INT, "Unix timestamp, 0 = no restriction"),
+                    "visible" => new external_value(PARAM_INT, "1 if visible, 0 if hidden"),
+                    "timemodified" => new external_value(PARAM_INT, "Unix timestamp"),
+                ])
+            ),
+            "warnings" => new external_warnings(),
+        ]);
+    }
 }

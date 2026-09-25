@@ -79,6 +79,19 @@ final class prepost_external_test extends \advanced_testcase {
         return [$course, $group];
     }
 
+    /**
+     * mod_questionnaire is an optional plugin. Tests that create a
+     * questionnaire activity, or that rely on get_prepost_questionnaires /
+     * get_prepost_questions reaching their per-course/per-cmid logic (rather
+     * than the moduleunavailable early return), must skip when it is absent.
+     */
+    private function skip_unless_questionnaire_installed(): void {
+        global $CFG;
+        if (!file_exists($CFG->dirroot . '/mod/questionnaire/lib.php')) {
+            $this->markTestSkipped('mod_questionnaire is not installed in this Moodle instance.');
+        }
+    }
+
     public function test_get_prepost_courses_returns_argentina_courses_with_groups(): void {
         $this->resetAfterTest();
         $this->setAdminUser();
@@ -136,5 +149,40 @@ final class prepost_external_test extends \advanced_testcase {
 
         $ids = array_column($result['courses'], 'id');
         $this->assertNotContains((int)$course->id, $ids, 'time_modified filter must be strictly greater than, not >=');
+    }
+
+    public function test_get_prepost_questionnaires_returns_instances_ordered_by_position(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->skip_unless_questionnaire_installed();
+
+        [$course] = $this->create_prepost_fixture();
+        $this->getDataGenerator()->create_module('questionnaire', ['course' => $course->id, 'name' => 'Pre']);
+        $this->getDataGenerator()->create_module('questionnaire', ['course' => $course->id, 'name' => 'Post']);
+
+        $result = \local_myddleware_external::get_prepost_questionnaires([$course->id], 0);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_questionnaires_returns(), $result);
+
+        $this->assertCount(2, $result['questionnaires']);
+        $names = array_column($result['questionnaires'], 'name');
+        $this->assertEqualsCanonicalizing(['Pre', 'Post'], $names);
+
+        $positions = array_column($result['questionnaires'], 'position');
+        $this->assertNotEquals($positions[0], $positions[1] ?? null, 'positions must be deterministic and distinct');
+    }
+
+    public function test_get_prepost_questionnaires_warns_on_missing_course(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->skip_unless_questionnaire_installed();
+
+        $result = \local_myddleware_external::get_prepost_questionnaires([999999], 0);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_questionnaires_returns(), $result);
+
+        $this->assertEmpty($result['questionnaires']);
+        $this->assertNotEmpty($result['warnings']);
+        $this->assertEquals('coursenotfound', $result['warnings'][0]['warningcode']);
     }
 }
