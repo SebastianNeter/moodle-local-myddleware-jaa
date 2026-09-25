@@ -25,7 +25,7 @@ require_once($CFG->dirroot . '/local/myddleware/externallib.php');
 /**
  * Tests for the PrePost platform read-only web services:
  * get_prepost_courses, get_prepost_questionnaires, get_prepost_questions,
- * get_prepost_responses_by_date.
+ * get_prepost_responses_by_date, get_prepost_group_members.
  *
  * NOT EXECUTED in this environment (no Moodle/PHPUnit test harness available
  * here — only `php -l` syntax checks were run). Schema assumptions for
@@ -714,5 +714,43 @@ final class prepost_external_test extends \advanced_testcase {
         $this->assertEmpty($result['responses']);
         $this->assertNotEmpty($result['warnings']);
         $this->assertEquals('cmnotfound', $result['warnings'][0]['warningcode']);
+    }
+
+    public function test_get_prepost_group_members_returns_members_with_timeadded(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+
+        [$course, $group] = $this->create_prepost_fixture();
+        $user = $this->getDataGenerator()->create_user();
+        // groups_add_member() returns false (silently, without throwing) for
+        // a user not enrolled in the group's course, so the fixture must
+        // enrol first -- see the F2 review's C1 finding.
+        $this->getDataGenerator()->enrol_user($user->id, $course->id, 'student');
+        $this->assertTrue(groups_add_member($group, $user));
+
+        $result = \local_myddleware_external::get_prepost_group_members([$group->id]);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_group_members_returns(), $result);
+
+        $this->assertCount(1, $result['groups']);
+        $this->assertEquals((int)$group->id, $result['groups'][0]['groupid']);
+        $userids = array_column($result['groups'][0]['members'], 'userid');
+        $this->assertContains((int)$user->id, $userids);
+        foreach ($result['groups'][0]['members'] as $member) {
+            $this->assertGreaterThan(0, $member['timeadded']);
+        }
+    }
+
+    public function test_get_prepost_group_members_warns_on_unknown_group(): void {
+        $this->resetAfterTest();
+        $this->setAdminUser();
+
+        $result = \local_myddleware_external::get_prepost_group_members([999999]);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_group_members_returns(), $result);
+
+        $this->assertEmpty($result['groups']);
+        $this->assertNotEmpty($result['warnings']);
+        $this->assertEquals('groupnotfound', $result['warnings'][0]['warningcode']);
     }
 }

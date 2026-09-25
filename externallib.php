@@ -3818,4 +3818,108 @@ class local_myddleware_external extends external_api {
             "warnings" => new external_warnings(),
         ]);
     }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_prepost_group_members_parameters() {
+        return new external_function_parameters([
+            "groupids" => new external_multiple_structure(
+                new external_value(PARAM_INT, "Moodle group ID"),
+                "List of group IDs to fetch members for (max 2000 per call; duplicates are de-duplicated)",
+                VALUE_REQUIRED
+            ),
+        ]);
+    }
+
+    /**
+     * Returns the members of each requested group with their "timeadded",
+     * needed by the app's earliest-membership tie-break when a person has
+     * responses in more than one "arg" group (spec ANLYS-5). Carries no PII
+     * beyond the Moodle user ID.
+     *
+     * Group existence and group membership are each resolved in one batched
+     * query for the whole request (W1), never one query per group id.
+     * Requested ids are de-duplicated and the request is capped at 2000 ids,
+     * same discipline as get_prepost_responses_by_date's "limit" clamp.
+     *
+     * @param array $groupids
+     * @return array
+     */
+    public static function get_prepost_group_members($groupids) {
+        global $DB;
+
+        $params = self::validate_parameters(
+            self::get_prepost_group_members_parameters(), ["groupids" => $groupids]);
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        $requestedgroupids = array_values(array_unique(array_map("intval", $params["groupids"])));
+        if (count($requestedgroupids) > 2000) {
+            throw new invalid_parameter_exception("groupids must not contain more than 2000 ids per call");
+        }
+
+        $warnings = [];
+        $validgroupids = [];
+        if (!empty($requestedgroupids)) {
+            $existinggroups = $DB->get_records_list("groups", "id", $requestedgroupids, "", "id");
+            foreach ($requestedgroupids as $groupid) {
+                if (!isset($existinggroups[$groupid])) {
+                    $warnings[] = [
+                        "item" => "group", "itemid" => $groupid,
+                        "warningcode" => "groupnotfound", "message" => "Group not found",
+                    ];
+                    continue;
+                }
+                $validgroupids[] = $groupid;
+            }
+        }
+
+        // One batched query for every requested group's members instead of
+        // one query per group.
+        $membersbygroup = array_fill_keys($validgroupids, []);
+        if (!empty($validgroupids)) {
+            $members = $DB->get_records_list(
+                "groups_members", "groupid", $validgroupids,
+                "groupid ASC, timeadded ASC", "id, groupid, userid, timeadded");
+            foreach ($members as $m) {
+                $membersbygroup[$m->groupid][] = ["userid" => (int)$m->userid, "timeadded" => (int)$m->timeadded];
+            }
+        }
+
+        $result = [];
+        foreach ($validgroupids as $groupid) {
+            $result[] = ["groupid" => (int)$groupid, "members" => $membersbygroup[$groupid]];
+        }
+
+        return ["groups" => $result, "warnings" => $warnings];
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_prepost_group_members_returns() {
+        return new external_single_structure([
+            "groups" => new external_multiple_structure(
+                new external_single_structure([
+                    "groupid" => new external_value(PARAM_INT, "Moodle group ID"),
+                    "members" => new external_multiple_structure(
+                        new external_single_structure([
+                            "userid" => new external_value(PARAM_INT, "Moodle user ID"),
+                            "timeadded" => new external_value(
+                                PARAM_INT,
+                                "Unix timestamp the user joined the group -- used for the earliest-membership " .
+                                "tie-break"
+                            ),
+                        ])
+                    ),
+                ])
+            ),
+            "warnings" => new external_warnings(),
+        ]);
+    }
 }
