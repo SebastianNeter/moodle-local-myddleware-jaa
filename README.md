@@ -73,7 +73,7 @@ vendor/bin/phpunit local/myddleware/tests/prepost_external_test.php --testdox
 On-demand pull functions added by JAA, documented in `docs/`:
 
 - [`get_courses_with_users_progress`](docs/API_get_courses_with_users_progress.md) / [`get_groups_with_users_progress`](docs/API_get_groups_with_users_progress.md) — Salesforce integration.
-- [`get_prepost_courses`](docs/API_get_prepost_courses.md), [`get_prepost_questionnaires`](docs/API_get_prepost_questionnaires.md), [`get_prepost_questions`](docs/API_get_prepost_questions.md), [`get_prepost_responses_by_date`](docs/API_get_prepost_responses_by_date.md) — PrePost platform sync.
+- [`get_prepost_courses`](docs/API_get_prepost_courses.md), [`get_prepost_questionnaires`](docs/API_get_prepost_questionnaires.md), [`get_prepost_questions`](docs/API_get_prepost_questions.md), [`get_prepost_responses_by_date`](docs/API_get_prepost_responses_by_date.md), [`get_prepost_group_members`](docs/API_get_prepost_group_members.md) — PrePost platform sync.
 
 ## Myddleware
 
