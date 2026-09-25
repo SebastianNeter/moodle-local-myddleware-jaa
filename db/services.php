@@ -153,6 +153,13 @@ $functions = [
             'description' => 'Return per-group info + members (students only) with enrolment, completion, lastaccess and custom profile fields. Designed for on-demand pull from a Salesforce button on a Group record. Per-group error model.',
             'type'        => 'read',
     ],
+    'local_myddleware_get_prepost_courses' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_prepost_courses',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return courses inside the Argentina category tree with their groups and the "arg" custom field value per group. Used by the PrePost platform sync.',
+            'type'        => 'read',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -178,6 +185,7 @@ $services = [
                         'local_myddleware_get_course_completion_percentage_by_country',
                         'local_myddleware_get_courses_with_users_progress',
                         'local_myddleware_get_groups_with_users_progress',
+                        'local_myddleware_get_prepost_courses',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',

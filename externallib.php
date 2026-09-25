@@ -2724,4 +2724,297 @@ class local_myddleware_external extends external_api {
             )
         );
     }
+
+    // =========================================================================
+    // PrePost Platform read functions (JAA).
+    //
+    // Read-only functions feeding the PrePost analysis app: courses inside the
+    // "Argentina" category tree with their groups (custom field "arg"),
+    // mod_questionnaire instances per course, and the questions/choices of a
+    // questionnaire. All three use the standard external_warnings structure
+    // for per-item failures so one bad id never fails the whole call.
+    //
+    // Added by JAA 2026-09-25.
+    // =========================================================================
+
+    /**
+     * Resolves the "Argentina" category id for prepost course filtering.
+     * Prefers the local_myddleware/prepost_category_id setting; falls back to
+     * the first category named "Argentina" (case-insensitive) when unset.
+     *
+     * @return array [categoryid|null, warning array|null]
+     */
+    private static function resolve_prepost_category_id() {
+        global $DB;
+
+        $configured = (int) get_config('local_myddleware', 'prepost_category_id');
+        if ($configured > 0) {
+            return [$configured, null];
+        }
+
+        // Targeted, case-insensitive lookup limited to one row instead of
+        // loading every course category to find the one named "Argentina".
+        $select = $DB->sql_equal('name', ':name', false);
+        $categories = $DB->get_records_select(
+            'course_categories', $select, ['name' => 'Argentina'], 'id ASC', 'id, name', 0, 1);
+        if ($categories) {
+            $category = reset($categories);
+            return [(int)$category->id, null];
+        }
+
+        return [null, [
+            'item' => 'category',
+            'itemid' => 0,
+            'warningcode' => 'categorynotfound',
+            'message' => 'No category named "Argentina" found and local_myddleware/prepost_category_id is not configured.',
+        ]];
+    }
+
+    /**
+     * Reads the "arg" custom field value for a batch of groups via the
+     * core_group customfield API (Moodle 4.3+), in a single DB round-trip
+     * per call instead of one get_instance_data() query per group.
+     *
+     * Returns false (the checkbox field's own default) for a group where the
+     * field is configured but has no explicit value set. The caller should
+     * only treat "arg" as unavailable/null when the "arg" field itself is
+     * not configured on this site at all (second return value is false) or
+     * the customfield API does not exist (Moodle < 4.3).
+     *
+     * @param int[] $groupids
+     * @return array [array $valuesbygroupid, bool $hasargfield]
+     */
+    private static function resolve_group_arg_values(array $groupids) {
+        $handler = \core_group\customfield\group_handler::create();
+
+        $hasargfield = false;
+        foreach ($handler->get_fields() as $field) {
+            if ($field->get('shortname') === 'arg') {
+                $hasargfield = true;
+                break;
+            }
+        }
+        if (!$hasargfield || empty($groupids)) {
+            return [[], $hasargfield];
+        }
+
+        $values = [];
+        foreach ($handler->get_instances_data($groupids, true) as $groupid => $fielddata) {
+            foreach ($fielddata as $data) {
+                if ($data->get_field()->get('shortname') === 'arg') {
+                    // The checkbox data_controller always returns a scalar
+                    // (its configured default when no data row exists), never
+                    // null, so every group present in $groupids gets a real
+                    // bool here. A per-group null never legitimately occurs;
+                    // "arg" is only null at the call-site level, when the
+                    // field itself is unconfigured or unavailable (see the
+                    // $hasargfield / $groupfieldsupported checks in the
+                    // caller).
+                    $values[$groupid] = (bool)$data->get_value();
+                    break;
+                }
+            }
+        }
+        return [$values, $hasargfield];
+    }
+
+    /**
+     * Returns description of method parameters.
+     * @return external_function_parameters.
+     */
+    public static function get_prepost_courses_parameters() {
+        return new external_function_parameters([
+            "time_modified" => new external_value(
+                PARAM_INT,
+                "Returns courses whose own timemodified, OR any of whose groups' timemodified, is strictly " .
+                "greater than this cursor (0 = no filter). Clients must advance the cursor to the max of the " .
+                "course's timemodified and all its groups' timemodified values found in the response payload, " .
+                "not just the course's own timemodified.",
+                VALUE_DEFAULT, 0),
+        ]);
+    }
+
+    /**
+     * Returns courses whose category path includes the "Argentina" category
+     * (see resolve_prepost_category_id), with all their groups and the
+     * "arg" custom field value per group. Callers filter groups on arg=true
+     * client-side; this function never drops a group server-side.
+     *
+     * @param int $timemodified
+     * @return array
+     */
+    public static function get_prepost_courses($timemodified = 0) {
+        global $DB;
+
+        $params = self::validate_parameters(
+            self::get_prepost_courses_parameters(),
+            ["time_modified" => $timemodified]
+        );
+
+        $context = context_system::instance();
+        self::validate_context($context);
+        require_capability("moodle/user:viewdetails", $context);
+
+        $warnings = [];
+        [$categoryid, $categorywarning] = self::resolve_prepost_category_id();
+        if ($categorywarning !== null) {
+            $warnings[] = $categorywarning;
+            return ["courses" => [], "warnings" => $warnings];
+        }
+
+        $category = $DB->get_record("course_categories", ["id" => $categoryid], "id, path", IGNORE_MISSING);
+        if (!$category) {
+            $warnings[] = [
+                "item" => "category",
+                "itemid" => $categoryid,
+                "warningcode" => "categorynotfound",
+                "message" => "Configured local_myddleware/prepost_category_id does not exist.",
+            ];
+            return ["courses" => [], "warnings" => $warnings];
+        }
+
+        $sql = "SELECT c.id, c.shortname, c.fullname, c.category AS categoryid, cc.path AS categorypath,
+                       c.startdate, c.enddate, c.visible, c.timemodified
+                  FROM {course} c
+                  JOIN {course_categories} cc ON cc.id = c.category
+                 WHERE c.id <> :siteid
+                   AND (cc.path = :catpath OR " . $DB->sql_like('cc.path', ':catpathlike') . ")";
+        $sqlparams = [
+            "siteid" => SITEID,
+            "catpath" => $category->path,
+            "catpathlike" => $category->path . "/%",
+        ];
+        if (!empty($params["time_modified"])) {
+            // A course row's own timemodified is not touched when only one of
+            // its groups changes (added, renamed, or removed), so also match
+            // courses with a recently-modified group (W3).
+            // groups_update_group() bumps groups.timemodified to time() up
+            // front and only then saves the group's custom field data
+            // (Moodle 4.5 group/lib.php:453,474), so an "arg" toggle made
+            // through the standard group edit form IS caught by this clause.
+            // Only a direct write via the core_customfield API that bypasses
+            // groups_update_group() (skipping the timemodified bump) would
+            // be missed; that is accepted as a residual gap because callers
+            // already re-read every group of a returned course, not just the
+            // changed one.
+            $sql .= " AND (c.timemodified > :timemodified
+                            OR EXISTS (SELECT 1 FROM {groups} g
+                                        WHERE g.courseid = c.id AND g.timemodified > :gtimemodified))";
+            $sqlparams["timemodified"] = $params["time_modified"];
+            $sqlparams["gtimemodified"] = $params["time_modified"];
+        }
+        $sql .= " ORDER BY c.timemodified ASC, c.id ASC";
+
+        $courses = $DB->get_records_sql($sql, $sqlparams);
+
+        // Fetch every course's groups in a single query instead of one
+        // get_records() round-trip per course, then resolve the "arg"
+        // custom field for all of them in a single batched call too (W5)
+        // instead of one get_instance_data() DB round-trip per group.
+        $coursegroups = array_fill_keys(array_keys($courses), []);
+        $allgroupids = [];
+        if (!empty($courses)) {
+            $groups = $DB->get_records_list(
+                "groups", "courseid", array_keys($courses),
+                "courseid ASC, name ASC", "id, courseid, name, idnumber, timemodified");
+            foreach ($groups as $g) {
+                $coursegroups[$g->courseid][] = $g;
+                $allgroupids[] = (int)$g->id;
+            }
+        }
+
+        $groupfieldsupported = class_exists('core_group\\customfield\\group_handler');
+        $argvalues = [];
+        $hasargfield = false;
+        if ($groupfieldsupported) {
+            [$argvalues, $hasargfield] = self::resolve_group_arg_values($allgroupids);
+            if (!$hasargfield) {
+                $warnings[] = [
+                    "item" => "group",
+                    "itemid" => 0,
+                    "warningcode" => "argfieldnotconfigured",
+                    "message" => "No group custom field with shortname \"arg\" is configured on this site.",
+                ];
+            }
+        } else {
+            $warnings[] = [
+                "item" => "group",
+                "itemid" => 0,
+                "warningcode" => "customfieldsunsupported",
+                "message" => "Group custom fields require Moodle 4.3+; arg is always null on this Moodle version.",
+            ];
+        }
+
+        $result = [];
+        foreach ($courses as $course) {
+            $coursedata = [
+                "id" => (int)$course->id,
+                "shortname" => $course->shortname,
+                "fullname" => $course->fullname,
+                "categoryid" => (int)$course->categoryid,
+                "categorypath" => $course->categorypath,
+                "startdate" => (int)$course->startdate,
+                "enddate" => (int)$course->enddate,
+                "visible" => (int)$course->visible,
+                "timemodified" => (int)$course->timemodified,
+                "groups" => [],
+            ];
+
+            foreach ($coursegroups[$course->id] as $g) {
+                $arg = null;
+                if ($groupfieldsupported && $hasargfield) {
+                    $arg = $argvalues[(int)$g->id] ?? false;
+                }
+                $coursedata["groups"][] = [
+                    "id" => (int)$g->id,
+                    "name" => $g->name,
+                    "idnumber" => $g->idnumber,
+                    "timemodified" => (int)$g->timemodified,
+                    "arg" => $arg,
+                ];
+            }
+
+            $result[] = $coursedata;
+        }
+
+        return ["courses" => $result, "warnings" => $warnings];
+    }
+
+    /**
+     * Returns description of method result value.
+     * @return external_description.
+     */
+    public static function get_prepost_courses_returns() {
+        return new external_single_structure([
+            "courses" => new external_multiple_structure(
+                new external_single_structure([
+                    "id" => new external_value(PARAM_INT, "Moodle course ID"),
+                    "shortname" => new external_value(PARAM_TEXT, "Course short name"),
+                    "fullname" => new external_value(PARAM_TEXT, "Course full name"),
+                    "categoryid" => new external_value(PARAM_INT, "Immediate course category ID"),
+                    "categorypath" => new external_value(PARAM_TEXT, "Moodle category path, e.g. /3/12"),
+                    "startdate" => new external_value(PARAM_INT, "Unix timestamp"),
+                    "enddate" => new external_value(PARAM_INT, "Unix timestamp, 0 = no end date"),
+                    "visible" => new external_value(PARAM_INT, "1 if visible, 0 if hidden"),
+                    "timemodified" => new external_value(PARAM_INT, "Unix timestamp"),
+                    "groups" => new external_multiple_structure(
+                        new external_single_structure([
+                            "id" => new external_value(PARAM_INT, "Moodle group ID"),
+                            "name" => new external_value(PARAM_TEXT, "Group name"),
+                            "idnumber" => new external_value(PARAM_TEXT, "Group external ID"),
+                            "timemodified" => new external_value(PARAM_INT, "Unix timestamp"),
+                            "arg" => new external_value(
+                                PARAM_BOOL,
+                                "Value of the group \"arg\" custom field (false when the field is configured but " .
+                                "not set on this group). Null only when the \"arg\" field is not configured on " .
+                                "this site, or on Moodle < 4.3 (no group custom fields API)",
+                                VALUE_OPTIONAL, null, NULL_ALLOWED
+                            ),
+                        ])
+                    ),
+                ])
+            ),
+            "warnings" => new external_warnings(),
+        ]);
+    }
 }
