@@ -3194,8 +3194,19 @@ class local_myddleware_external extends external_api {
         // skips typeid 7.
         $typenames = $DB->get_records("questionnaire_question_type", null, "", "typeid, type");
 
+        [$deletedwhere, $deletedparams, $legacydeletedcolumn] = self::prepost_active_question_where();
+
         $questions = [];
         $warnings = [];
+
+        if ($legacydeletedcolumn) {
+            $warnings[] = [
+                "item" => "questionnaire_question", "itemid" => 0,
+                "warningcode" => "legacydeletedcolumn",
+                "message" => "mod_questionnaire on this site stores questionnaire_question.deleted as the " .
+                    "legacy CHAR(1) 'y'/'n' flag instead of an int timestamp. Consider upgrading the plugin.",
+            ];
+        }
 
         foreach ($params["questionnaireids"] as $cmid) {
             // Validate the cmid actually belongs to a questionnaire module; a
@@ -3220,18 +3231,39 @@ class local_myddleware_external extends external_api {
                 continue;
             }
 
-            // "deleted" is an int timestamp (NULL = active) since upgrade.php
-            // step 1038-1050, not the legacy 'y'/'n' char flag. Type_id 99
-            // and 100 are the page-break and section-text layout rows, not
-            // real questions, and must not pollute the question master.
+            // "deleted" is only an int timestamp (NULL = active) on
+            // mod_questionnaire branches that carry upgrade.php savepoint
+            // 2025041400.02 (MOODLE_500_STABLE+). The officially tagged
+            // v4.4.0 release (build 2025110900) still ships db/install.xml
+            // with "deleted" as CHAR(1) NOTNULL DEFAULT 'n' -- the exact
+            // legacy schema questionnaire.class.php::add_questions() itself
+            // queries via "surveyid = ? AND deleted = ?" / 'n'. Using
+            // "deleted IS NULL" unconditionally against that column returns
+            // zero rows forever, since it is NOTNULL. prepost_active_question_where()
+            // detects the real column type at runtime and picks the right
+            // comparison. Type_id 99 and 100 are the page-break and
+            // section-text layout rows, not real questions, and must not
+            // pollute the question master.
             $questionrecords = $DB->get_records_select(
                 "questionnaire_question",
-                "surveyid = :surveyid AND deleted IS NULL AND type_id NOT IN (99, 100)",
-                ["surveyid" => $questionnaire->sid],
+                "surveyid = :surveyid AND $deletedwhere AND type_id NOT IN (99, 100)",
+                ["surveyid" => $questionnaire->sid] + $deletedparams,
                 "position ASC, id ASC"
             );
 
             if (empty($questionrecords)) {
+                $diagnostics = self::prepost_question_diagnostics($questionnaire->sid);
+                $warnings[] = [
+                    "item" => "questionnaire_question", "itemid" => (int)$questionnaire->sid,
+                    "warningcode" => "noquestions",
+                    "message" => sprintf(
+                        "No active questions found for cmid=%d sid=%d: total=%d, deleted_null=%d, " .
+                        "deleted_zero=%d, deleted_positive=%d, type_ids=[%s].",
+                        $cmid, $questionnaire->sid, $diagnostics["total"], $diagnostics["deletednull"],
+                        $diagnostics["deletedzero"], $diagnostics["deletedpositive"],
+                        implode(",", $diagnostics["typeids"])
+                    ),
+                ];
                 continue;
             }
 
@@ -3276,6 +3308,82 @@ class local_myddleware_external extends external_api {
         }
 
         return ["questions" => $questions, "warnings" => $warnings];
+    }
+
+    /**
+     * Builds the WHERE fragment (and params) that selects only "active"
+     * (non-deleted) rows from questionnaire_question, tolerant of both
+     * mod_questionnaire schemas seen in the wild:
+     * - Legacy: "deleted" CHAR(1) NOTNULL DEFAULT 'n' ('y'/'n'), still
+     *   shipped in the officially tagged v4.4.0 release (build 2025110900).
+     *   "deleted" can never be NULL here, only 'n' (active) or 'y' (deleted).
+     * - Modern: "deleted" INT (NULL = active timestamp unset), introduced by
+     *   upgrade.php savepoint 2025041400.02 (MOODLE_500_STABLE+). A stray 0
+     *   is also tolerated as active (belt-and-braces for a partially
+     *   migrated site); only a positive timestamp counts as a real deletion.
+     * - Missing column entirely (pre-2007 mod_questionnaire): no filter.
+     *
+     * @param string $table Defaults to "questionnaire_question"; overridable for tests.
+     * @return array [string $sql, array $params, bool $legacy] $legacy is
+     *      true when the char-based fallback path was used, so the caller
+     *      can surface an informational warning about the outdated schema.
+     */
+    private static function prepost_active_question_where($table = "questionnaire_question") {
+        global $DB;
+
+        $columns = $DB->get_columns($table);
+        if (!isset($columns["deleted"])) {
+            return ["1=1", [], false];
+        }
+
+        $column = $columns["deleted"];
+        $ischar = (isset($column->meta_type) && $column->meta_type === "C")
+            || (isset($column->type) && stripos((string)$column->type, "char") !== false);
+
+        if ($ischar) {
+            return ["(deleted IS NULL OR deleted = :prepostdeletedn)", ["prepostdeletedn" => "n"], true];
+        }
+
+        return ["(deleted IS NULL OR deleted = 0)", [], false];
+    }
+
+    /**
+     * Aggregate, content-free diagnostics for a survey that yielded zero
+     * active questions -- helps distinguish "really has no questions",
+     * "wrong sid", and "deleted-column filter still wrong on this site"
+     * without ever returning question text in a warning.
+     *
+     * @param int $surveyid
+     * @return array
+     */
+    private static function prepost_question_diagnostics($surveyid) {
+        global $DB;
+
+        $rows = $DB->get_records("questionnaire_question", ["surveyid" => $surveyid], "", "id, deleted, type_id");
+
+        $deletednull = 0;
+        $deletedzero = 0;
+        $deletedpositive = 0;
+        $typeids = [];
+
+        foreach ($rows as $row) {
+            if ($row->deleted === null) {
+                $deletednull++;
+            } else if ($row->deleted === "0" || $row->deleted === 0 || $row->deleted === "n") {
+                $deletedzero++;
+            } else {
+                $deletedpositive++;
+            }
+            $typeids[(int)$row->type_id] = true;
+        }
+
+        return [
+            "total" => count($rows),
+            "deletednull" => $deletednull,
+            "deletedzero" => $deletedzero,
+            "deletedpositive" => $deletedpositive,
+            "typeids" => array_keys($typeids),
+        ];
     }
 
     /**

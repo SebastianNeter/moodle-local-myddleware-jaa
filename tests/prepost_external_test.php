@@ -337,6 +337,163 @@ final class prepost_external_test extends \advanced_testcase {
         $this->assertEquals(1, $result['questions'][0]['typeid']);
     }
 
+    /**
+     * prepost_active_question_where() is private and its two live branches
+     * (legacy CHAR 'y'/'n' vs modern INT timestamp) can't both be exercised
+     * against the single mod_questionnaire schema actually installed in any
+     * one test run. Rather than mutate the real questionnaire_question
+     * table's column type (invasive, and would desync every other test in
+     * this class), this creates two throwaway XMLDB tables -- one per
+     * column type -- and calls the helper against each via reflection. This
+     * is the "small seam" the task asked for: honest about not being a
+     * true end-to-end mod_questionnaire integration test, but it does
+     * verify the actual runtime column-type branching logic.
+     */
+    public function test_prepost_active_question_where_detects_char_and_int_columns(): void {
+        global $DB;
+
+        $this->resetAfterTest();
+
+        $dbman = $DB->get_manager();
+        $method = new \ReflectionMethod(\local_myddleware_external::class, 'prepost_active_question_where');
+        $method->setAccessible(true);
+
+        $chartable = new \xmldb_table('test_prepost_del_char');
+        $chartable->add_field('id', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, XMLDB_SEQUENCE);
+        $chartable->add_field('deleted', XMLDB_TYPE_CHAR, '1', null, XMLDB_NOTNULL, null, 'n');
+        $chartable->add_key('primary', XMLDB_KEY_PRIMARY, ['id']);
+
+        $inttable = new \xmldb_table('test_prepost_del_int');
+        $inttable->add_field('id', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, XMLDB_SEQUENCE);
+        $inttable->add_field('deleted', XMLDB_TYPE_INTEGER, '10', null, null, null, null);
+        $inttable->add_key('primary', XMLDB_KEY_PRIMARY, ['id']);
+
+        try {
+            $dbman->create_table($chartable);
+            $dbman->create_table($inttable);
+
+            [$sql, $params, $legacy] = $method->invoke(null, 'test_prepost_del_char');
+            $this->assertTrue($legacy);
+            $this->assertSame(['prepostdeletedn' => 'n'], $params);
+            $this->assertStringContainsString(':prepostdeletedn', $sql);
+
+            [$sql, $params, $legacy] = $method->invoke(null, 'test_prepost_del_int');
+            $this->assertFalse($legacy);
+            $this->assertSame([], $params);
+            $this->assertStringContainsString('deleted = 0', $sql);
+
+            [$sql, $params, $legacy] = $method->invoke(null, 'test_prepost_del_missing');
+            $this->assertFalse($legacy);
+            $this->assertSame('1=1', $sql);
+        } finally {
+            if ($dbman->table_exists($chartable)) {
+                $dbman->drop_table($chartable);
+            }
+            if ($dbman->table_exists($inttable)) {
+                $dbman->drop_table($inttable);
+            }
+        }
+    }
+
+    /**
+     * Production finding (campus running mod_questionnaire release v4.4.0,
+     * build 2025110900): questionnaire_question.deleted on that release is
+     * still the legacy CHAR(1) NOTNULL DEFAULT 'n' column (confirmed
+     * against db/install.xml at tag v4.4.0 upstream), so "deleted IS NULL"
+     * matched zero rows on every questionnaire. This also guards the
+     * defensive int-schema tolerance added alongside the char fix: a 0
+     * sentinel must count as active and only a positive timestamp as
+     * really deleted.
+     */
+    public function test_get_prepost_questions_treats_deleted_zero_as_active_not_positive_timestamp(): void {
+        global $DB;
+
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->skip_unless_questionnaire_installed();
+
+        [$course] = $this->create_prepost_fixture();
+        $questionnaire = $this->getDataGenerator()->create_module(
+            'questionnaire', ['course' => $course->id, 'name' => 'Pre']);
+        $instance = $DB->get_record('questionnaire', ['id' => $questionnaire->id], '*', MUST_EXIST);
+        $cm = get_coursemodule_from_instance('questionnaire', $questionnaire->id, $course->id, false, MUST_EXIST);
+
+        $DB->insert_record('questionnaire_question', (object)[
+            'surveyid' => $instance->sid,
+            'name' => '',
+            'type_id' => 1,
+            'result_id' => 0,
+            'length' => 0,
+            'precise' => 0,
+            'position' => 1,
+            'content' => 'Active question, deleted=0 sentinel',
+            'required' => 'y',
+            'deleted' => 0,
+        ]);
+        $DB->insert_record('questionnaire_question', (object)[
+            'surveyid' => $instance->sid,
+            'name' => '',
+            'type_id' => 1,
+            'result_id' => 0,
+            'length' => 0,
+            'precise' => 0,
+            'position' => 2,
+            'content' => 'Really deleted question',
+            'required' => 'n',
+            'deleted' => 1690000000,
+        ]);
+
+        $result = \local_myddleware_external::get_prepost_questions([$cm->id]);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_questions_returns(), $result);
+
+        $this->assertCount(1, $result['questions']);
+        $this->assertEquals('Active question, deleted=0 sentinel', $result['questions'][0]['content']);
+    }
+
+    public function test_get_prepost_questions_warns_noquestions_with_diagnostics_when_all_deleted(): void {
+        global $DB;
+
+        $this->resetAfterTest();
+        $this->setAdminUser();
+        $this->skip_unless_questionnaire_installed();
+
+        [$course] = $this->create_prepost_fixture();
+        $questionnaire = $this->getDataGenerator()->create_module(
+            'questionnaire', ['course' => $course->id, 'name' => 'Pre']);
+        $instance = $DB->get_record('questionnaire', ['id' => $questionnaire->id], '*', MUST_EXIST);
+        $cm = get_coursemodule_from_instance('questionnaire', $questionnaire->id, $course->id, false, MUST_EXIST);
+
+        $DB->insert_record('questionnaire_question', (object)[
+            'surveyid' => $instance->sid,
+            'name' => '',
+            'type_id' => 1,
+            'result_id' => 0,
+            'length' => 0,
+            'precise' => 0,
+            'position' => 1,
+            'content' => 'Deleted question',
+            'required' => 'n',
+            'deleted' => 1690000000,
+        ]);
+
+        $result = \local_myddleware_external::get_prepost_questions([$cm->id]);
+        $result = \external_api::clean_returnvalue(
+            \local_myddleware_external::get_prepost_questions_returns(), $result);
+
+        $this->assertEmpty($result['questions']);
+        $noquestions = null;
+        foreach ($result['warnings'] as $warning) {
+            if ($warning['warningcode'] === 'noquestions') {
+                $noquestions = $warning;
+            }
+        }
+        $this->assertNotNull($noquestions);
+        $this->assertEquals((int)$instance->sid, $noquestions['itemid']);
+        $this->assertStringContainsString('total=1', $noquestions['message']);
+        $this->assertStringContainsString('deleted_positive=1', $noquestions['message']);
+    }
+
     public function test_get_prepost_questions_warns_on_missing_questionnaire(): void {
         $this->resetAfterTest();
         $this->setAdminUser();

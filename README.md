@@ -75,6 +75,11 @@ On-demand pull functions added by JAA, documented in `docs/`:
 - [`get_courses_with_users_progress`](docs/API_get_courses_with_users_progress.md) / [`get_groups_with_users_progress`](docs/API_get_groups_with_users_progress.md) — Salesforce integration.
 - [`get_prepost_courses`](docs/API_get_prepost_courses.md), [`get_prepost_questionnaires`](docs/API_get_prepost_questionnaires.md), [`get_prepost_questions`](docs/API_get_prepost_questions.md), [`get_prepost_responses_by_date`](docs/API_get_prepost_responses_by_date.md), [`get_prepost_group_members`](docs/API_get_prepost_group_members.md) — PrePost platform sync.
 
+### Changelog
+
+- **2.4.3**: `get_prepost_questions` now detects the `questionnaire_question.deleted` column type at runtime instead of assuming the int-timestamp schema, fixing an empty `questions` result on sites running mod_questionnaire releases that still use the legacy `CHAR(1)` `'y'`/`'n'` flag (e.g. the officially tagged `v4.4.0`). Adds informational `legacydeletedcolumn` and `noquestions` (with aggregate diagnostics) warnings.
+- **2.4.2**: see prior PRs.
+
 ## Myddleware
 
 ### More about Myddleware
