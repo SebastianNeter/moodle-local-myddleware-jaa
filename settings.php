@@ -15,18 +15,24 @@
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
 /**
- * External Web Service Template
+ * Admin settings for local_myddleware.
  *
  * @package    local_myddleware
- * @copyright  2017 Myddleware
- * @author     Myddleware ltd
+ * @copyright  2026 JAA
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
+
 defined('MOODLE_INTERNAL') || die();
 
-$plugin->version  = 2026092500;
-$plugin->requires = 2010112401;
-$plugin->cron     = 0;
-$plugin->release = '2.4.0';
-$plugin->maturity = MATURITY_STABLE;
-$plugin->component = 'local_myddleware';
+if ($hassiteconfig) {
+    $settings = new admin_settingpage('local_myddleware', get_string('pluginname', 'local_myddleware'));
+    $ADMIN->add('localplugins', $settings);
+
+    $settings->add(new admin_setting_configtext(
+        'local_myddleware/prepost_category_id',
+        get_string('prepost_category_id', 'local_myddleware'),
+        get_string('prepost_category_id_desc', 'local_myddleware'),
+        '',
+        PARAM_INT
+    ));
+}
