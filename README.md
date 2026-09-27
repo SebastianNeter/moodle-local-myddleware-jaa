@@ -66,6 +66,14 @@ Add the URL of your Moodle instance and your token in Myddleware
 in your root directory, run the following command. Make sure you have installed the phpunit package and initialized it.
 
 vendor/bin/phpunit local/myddleware/tests/provider_test.php --testdox
+vendor/bin/phpunit local/myddleware/tests/prepost_external_test.php --testdox
+
+### JAA custom functions (not upstream Myddleware)
+
+On-demand pull functions added by JAA, documented in `docs/`:
+
+- [`get_courses_with_users_progress`](docs/API_get_courses_with_users_progress.md) / [`get_groups_with_users_progress`](docs/API_get_groups_with_users_progress.md) — Salesforce integration.
+- [`get_prepost_courses`](docs/API_get_prepost_courses.md), [`get_prepost_questionnaires`](docs/API_get_prepost_questionnaires.md), [`get_prepost_questions`](docs/API_get_prepost_questions.md) — PrePost platform sync.
 
 ## Myddleware
 
