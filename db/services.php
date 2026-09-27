@@ -181,6 +181,13 @@ $functions = [
             'description' => 'Return STUDENT-role responses of the requested questionnaires with their answers, incrementally by submission date. Used by the PrePost platform sync.',
             'type'        => 'read',
     ],
+    'local_myddleware_get_prepost_group_members' => [
+            'classname'   => 'local_myddleware_external',
+            'methodname'  => 'get_prepost_group_members',
+            'classpath'   => 'local/myddleware/externallib.php',
+            'description' => 'Return the members of the requested groups with their join timestamp. Used by the PrePost platform group-attribution tie-break.',
+            'type'        => 'read',
+    ],
 ];
 
 // We define the services to install as pre-build services.
@@ -210,6 +217,7 @@ $services = [
                         'local_myddleware_get_prepost_questionnaires',
                         'local_myddleware_get_prepost_questions',
                         'local_myddleware_get_prepost_responses_by_date',
+                        'local_myddleware_get_prepost_group_members',
                         'core_course_create_courses',
                         'core_course_get_categories',
                         'core_course_get_courses_by_field',
