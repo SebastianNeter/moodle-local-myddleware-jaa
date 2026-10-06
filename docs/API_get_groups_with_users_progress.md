@@ -100,7 +100,13 @@ JSON array of groups. The order matches the order of `groupids` in the request.
         "custom_fields": {
           "residencia": "{mlang en}Argentina{mlang}{mlang es}Argentina{mlang}{mlang pt_br}Argentina{mlang}",
           "genero": "{mlang en}Male{mlang}{mlang es}Masculino{mlang}{mlang pt_br}Masculino{mlang}",
-          "nacimiento": "1776135600"
+          "nacimiento": "1776135600",
+          "telefono": "1160181367"
+        },
+        "campaign": {
+          "utm_source": "paid",
+          "utm_medium": "domino",
+          "utm_campaign": "ig_vnz"
         }
       }
     ],
@@ -196,10 +202,33 @@ Only users with the **student** archetype role on the parent course are returned
 | `residencia` | string \| null | User profile field "Residencia". May contain multi-language tags |
 | `genero` | string \| null | User profile field "Genero". May contain multi-language tags |
 | `nacimiento` | string \| null | User profile field "Nacimiento". Stored as Unix timestamp string in Moodle |
+| `telefono` | string \| null | User profile field "Telefono". Added in 2.6.2 for campaign follow-up |
 
 > **Note about multi-language tags**: consistent with the course-centric method, values are returned **as stored in Moodle** (not stripped). Strings like `{mlang en}Argentina{mlang}{mlang es}Argentina{mlang}{mlang pt_br}Argentina{mlang}` need to be parsed on the SF side. This is intentional — both `on-demand pull` endpoints share the same contract.
 >
 > (Note: the Myddleware-driven method `get_roc_group_enrolments` DOES strip to Spanish because it feeds a staging object. These are different contracts for different consumers.)
+
+### Campaign object
+
+Marketing attribution written by the course landing plugin (`local_course_landing_attr`). Added in 2.6.2.
+
+| Field | Type | Description |
+|---|---|---|
+| `utm_source` | string | Campaign source, e.g. `paid`. Empty string when the member has no attribution |
+| `utm_medium` | string | Campaign medium, e.g. `domino` |
+| `utm_campaign` | string | Campaign name, e.g. `ig_vnz` |
+
+**The object is always present.** When the member did not arrive through a landing page, the three keys come back as empty strings — never absent, never null. Consumers do not need to handle a missing object.
+
+Attribution rules, in order:
+
+1. **Rows with no UTM data at all are ignored.** The landing plugin records a row for every landing visit, including direct hits with no campaign parameters. Those rows do not count as attribution. A row with at least one non-empty UTM value is kept.
+2. **The earliest remaining row wins** (first-touch model). This is why rule 1 matters: without it, an early direct visit would mask a later campaign click.
+3. **The lookup key is user + course + group.** The same student in two different groups can therefore carry two different campaigns.
+
+These rules are deliberately identical to `get_roc_group_enrolments`, so both endpoints report the same attribution for the same member. If you change one, change the other.
+
+If the landing plugin is not installed, the query fails silently and all three keys come back empty — the endpoint never breaks over missing attribution.
 
 ## Error handling
 
@@ -214,7 +243,9 @@ The endpoint follows a **per-group error model**: if one group ID is invalid, th
 ## Performance considerations
 
 - Completion is computed per user per activity. For groups with many members in a course with many tracked activities, response time scales linearly. Recommended max: **~200 members per group call**. For larger groups, split.
+- **Measured on production, 2026-10-06**: a 6-member group answers in ~1.9 s; a 519-member group takes **~138 s**, i.e. roughly 265 ms per member. Salesforce caps a callout at 120 s, so a single call on a group of that size will time out. The cost is `get_fast_modinfo($course, $uid)` plus `$completioninfo->get_data()` inside the per-member loop. The batch-query pattern used by `get_course_completion_percentage_by_country` and the PrePost methods would remove it; porting it here is pending.
 - Custom profile fields are fetched in one batch query per group.
+- Campaign attribution is fetched in one batch query per group (measured at 6 ms for 519 members against a 349-row table indexed on `userid, courseid`).
 - `lastaccess` is LEFT JOIN so it never blocks.
 - Batching multiple groups in one request is fine as long as the combined member count stays reasonable.
 
@@ -272,3 +303,4 @@ All three are read-only. They coexist without overlap.
 
 - **2026-04-24** (plugin v2.3.3, version `2026042401`): added by JAA patch. Separate method from the course-centric one — no breaking change to existing consumers.
 - **2026-05-26** (plugin v2.4.1, version `2026052202`): **BREAKING semantics change**. `completion.percentage`, `completed_activities` and `total_activities` now count ONLY activities required for course completion (`course_completion_criteria.criteriatype = 4`), not all completion-tracked activities. New error value `"No required activities configured for this course"`. Salesforce consumers that read `percentage` must be aware the number now reflects required-activity progress. Field names unchanged (no payload schema break).
+- **2026-10-06** (plugin v2.6.2, version `2026100600`): **additive only, no breaking change**. Added `custom_fields.telefono` and the new `campaign` object (`utm_source`, `utm_medium`, `utm_campaign`). No existing field was removed or renamed, so consumers on the previous contract keep working untouched. The UTM semantics match `get_roc_group_enrolments` so both endpoints agree on the same member. Deployed to production the same day; verified on group 17285 (519 members), which returned the expected `paid / domino / ig_vnz` for the sampled user and attribution for 282 of 519 members.
