@@ -3083,8 +3083,9 @@ class local_myddleware_external extends external_api {
         self::validate_context($context);
         require_capability("moodle/user:viewdetails", $context);
 
-        // Same 3 custom profile fields as get_courses_with_users_progress.
-        $customfieldshortnames = ["residencia", "genero", "nacimiento"];
+        // Custom profile fields exposed to the Salesforce Group-record button.
+        // "telefono" was added for the Open Access campaign follow-up.
+        $customfieldshortnames = ["residencia", "genero", "nacimiento", "telefono"];
 
         // Resolve the "student" archetype role IDs once.
         $studentroleids = [];
@@ -3251,6 +3252,35 @@ class local_myddleware_external extends external_api {
                 }
             }
 
+            // 3b) Campaign attribution (UTMs) written by the course landing plugin.
+            //     Same semantics as get_roc_group_enrolments so both services report
+            //     identical values for the same member: rows without any UTM value are
+            //     ignored, the EARLIEST remaining row wins (first-touch), and the lookup
+            //     key is userid_courseid_groupid.
+            $utmbykey = [];
+            list($utmuseridsql, $utmuseridparams) = $DB->get_in_or_equal(
+                array_keys($usersbyid), SQL_PARAMS_NAMED, "lu");
+            $utmsql = "
+                SELECT la.id, la.userid, la.courseid, la.groupid,
+                       la.utm_source, la.utm_medium, la.utm_campaign
+                FROM {local_course_landing_attr} la
+                WHERE la.userid $utmuseridsql
+                  AND (la.utm_source <> '' OR la.utm_medium <> '' OR la.utm_campaign <> '')
+                ORDER BY la.timecreated ASC, la.id ASC
+            ";
+            try {
+                $utmrecords = $DB->get_records_sql($utmsql, $utmuseridparams);
+                foreach ($utmrecords as $ur) {
+                    $utmkey = (int)$ur->userid . "_" . (int)$ur->courseid . "_" . (int)$ur->groupid;
+                    if (!isset($utmbykey[$utmkey])) {
+                        $utmbykey[$utmkey] = $ur;
+                    }
+                }
+            } catch (Exception $e) {
+                // The landing plugin may be absent: campaign attribution is optional.
+                $utmbykey = [];
+            }
+
             // 4) Completion per user — counts ONLY activities required for course completion
             //    (criteria type 4 = activity completion criterion). Activities outside the
             //    course_completion_criteria are ignored for the percentage. See API doc
@@ -3333,6 +3363,8 @@ class local_myddleware_external extends external_api {
                     $userfields[$sn] = $customfieldsbyuser[$uid][$sn] ?? null;
                 }
 
+                $utm = $utmbykey[$uid . "_" . (int)$course->id . "_" . (int)$groupid] ?? null;
+
                 $groupbase["members"][] = [
                     "userid" => $uid,
                     "username" => $u->username,
@@ -3360,6 +3392,11 @@ class local_myddleware_external extends external_api {
                     ],
                     "lastaccess" => (int)($u->lastaccess ?? 0),
                     "custom_fields" => $userfields,
+                    "campaign" => [
+                        "utm_source" => (string)($utm->utm_source ?? ""),
+                        "utm_medium" => (string)($utm->utm_medium ?? ""),
+                        "utm_campaign" => (string)($utm->utm_campaign ?? ""),
+                    ],
                 ];
             }
 
@@ -3426,6 +3463,12 @@ class local_myddleware_external extends external_api {
                                 "residencia" => new external_value(PARAM_RAW, "User residencia profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
                                 "genero" => new external_value(PARAM_RAW, "User genero profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
                                 "nacimiento" => new external_value(PARAM_RAW, "User nacimiento profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                                "telefono" => new external_value(PARAM_RAW, "User telefono profile field", VALUE_OPTIONAL, null, NULL_ALLOWED),
+                            ]),
+                            "campaign" => new external_single_structure([
+                                "utm_source" => new external_value(PARAM_RAW, "Campaign source (utm_source)", VALUE_OPTIONAL, ""),
+                                "utm_medium" => new external_value(PARAM_RAW, "Campaign medium (utm_medium)", VALUE_OPTIONAL, ""),
+                                "utm_campaign" => new external_value(PARAM_RAW, "Campaign name (utm_campaign)", VALUE_OPTIONAL, ""),
                             ]),
                         ])
                     ),
