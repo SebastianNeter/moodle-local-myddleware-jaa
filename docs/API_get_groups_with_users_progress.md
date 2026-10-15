@@ -242,8 +242,19 @@ The endpoint follows a **per-group error model**: if one group ID is invalid, th
 
 ## Performance considerations
 
-- Completion is computed per user per activity. For groups with many members in a course with many tracked activities, response time scales linearly. Recommended max: **~200 members per group call**. For larger groups, split.
-- **Measured on production, 2026-10-06**: a 6-member group answers in ~1.9 s; a 519-member group takes **~138 s**, i.e. roughly 265 ms per member. Salesforce caps a callout at 120 s, so a single call on a group of that size will time out. The cost is `get_fast_modinfo($course, $uid)` plus `$completioninfo->get_data()` inside the per-member loop. The batch-query pattern used by `get_course_completion_percentage_by_country` and the PrePost methods would remove it; porting it here is pending.
+- Completion is computed **in batch per group**, not per member (since 2.6.3). The denominator — required, completion-tracked activities — is resolved once per course with `get_fast_modinfo($course)`; the per-member state comes from two queries against `course_modules_completion` and `course_completions`. Response time is therefore driven by member count only weakly.
+- **Measured on production, 2026-10-15**, before and after the change:
+
+  | Members | Before 2.6.3 | After |
+  |---|---|---|
+  | 6 | 1.0 s | 0.2 s |
+  | 175 | 0.2 s | 0.01 s |
+  | 1,037 | 3 m 07 s | 1.1 s |
+  | 1,646 | 7 m 15 s | 2.8 s |
+  | 2,984 | **12 m 44 s** | **3.2 s** |
+
+  Salesforce caps a callout at 120 s. Before the change, groups over roughly 450 members timed out; after it, a 2,984-member group answers in about 3 seconds, so **member-level pagination is not needed** and consumers require no change.
+- **The figures are unchanged.** The new implementation was compared against the previous one member by member over **5,848 members in 5 courses** — percentage, completed, total, overall status and timemodified — with zero differences. The sample included courses with no `criteriatype=4` criteria, `COMPLETION_COMPLETE_FAIL` rows and teacher overrides.
 - Custom profile fields are fetched in one batch query per group.
 - Campaign attribution is fetched in one batch query per group (measured at 6 ms for 519 members against a 349-row table indexed on `userid, courseid`).
 - `lastaccess` is LEFT JOIN so it never blocks.
@@ -304,3 +315,4 @@ All three are read-only. They coexist without overlap.
 - **2026-04-24** (plugin v2.3.3, version `2026042401`): added by JAA patch. Separate method from the course-centric one — no breaking change to existing consumers.
 - **2026-05-26** (plugin v2.4.1, version `2026052202`): **BREAKING semantics change**. `completion.percentage`, `completed_activities` and `total_activities` now count ONLY activities required for course completion (`course_completion_criteria.criteriatype = 4`), not all completion-tracked activities. New error value `"No required activities configured for this course"`. Salesforce consumers that read `percentage` must be aware the number now reflects required-activity progress. Field names unchanged (no payload schema break).
 - **2026-10-06** (plugin v2.6.2, version `2026100600`): **additive only, no breaking change**. Added `custom_fields.telefono` and the new `campaign` object (`utm_source`, `utm_medium`, `utm_campaign`). No existing field was removed or renamed, so consumers on the previous contract keep working untouched. The UTM semantics match `get_roc_group_enrolments` so both endpoints agree on the same member. Deployed to production the same day; verified on group 17285 (519 members), which returned the expected `paid / domino / ig_vnz` for the sampled user and attribution for 282 of 519 members.
+- **2026-10-15** (plugin v2.6.3, version `2026101500`): **performance only, no contract change**. Completion is now computed in batch per group instead of once per member. No field was added, removed or renamed, and the figures are identical — verified member by member over 5,848 members in 5 courses, zero differences. A 2,984-member group went from 12 m 44 s to 3.2 s, which removes the Salesforce callout timeout on large groups. Consumers need no change and can drop any extended timeout they added as a workaround.
